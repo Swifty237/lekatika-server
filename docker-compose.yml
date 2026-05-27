@@ -1,0 +1,17 @@
+name: lekatika-server
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: postgres_db
+    environment:
+      POSTGRES_USER: lekatikadmin
+      POSTGRES_PASSWORD: Le_Nj@mb0237
+      POSTGRES_DB: lekatikadb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
