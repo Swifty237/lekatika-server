@@ -12,9 +12,10 @@ import (
 )
 
 type RegisterInput struct {
-	Username string `json:"username" binding:"required"`
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=6"`
+	Username        string   `json:"username" binding:"required"`
+	Email           string   `json:"email" binding:"required,email"`
+	Password        string   `json:"password" binding:"required,min=6"`
+	FreeChipsAmount *float64 `json:"freeChipsAmount,omitempty"`
 }
 
 type LoginInput struct {
@@ -38,8 +39,9 @@ func Register(c *gin.Context) {
 
 	// Créer un nouvel utilisateur
 	user := models.User{
-		Username: input.Username,
-		Email:    input.Email,
+		Username:        input.Username,
+		Email:           input.Email,
+		FreeChipsAmount: input.FreeChipsAmount,
 	}
 	if err := user.HashPassword(input.Password); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -88,9 +90,16 @@ func Login(c *gin.Context) {
 		"message": "Login successful",
 		"token":   tokenString,
 		"user": gin.H{
-			"id":       user.ID,
-			"username": user.Username,
-			// "email":    user.Email,
+			"id":                 user.ID,
+			"username":           user.Username,
+			"email":              user.Email,
+			"freeChipsAmount":    user.FreeChipsAmount,
+			"realChipsAmount":    user.RealChipsAmount,
+			"profilePictureLink": user.ProfilePictureLink,
+			"lastModification":   user.LastModification,
+			"playingTableId":     user.PlayingTableID,
+			"personalDetailsId":  user.PersonalDetailsID,
+			"paymentDetailsId":   user.PaymentDetailsID,
 		},
 	})
 }
