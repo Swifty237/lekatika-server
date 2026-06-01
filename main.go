@@ -6,8 +6,11 @@ import (
 	"lekatika-server/middleware" // À créer
 	"time"
 
+	"net/http"
+
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
 func main() {
@@ -15,6 +18,10 @@ func main() {
 	database.Connect()
 	// Connexion à Redis
 	database.ConnectRedis()
+
+	hub := NewHub()
+	go hub.Run()
+	go hub.subscribeToRedis() // <-- nouvelle goroutine
 
 	router := gin.Default()
 
@@ -35,6 +42,10 @@ func main() {
 		authGroup.POST("/login", controllers.Login)
 	}
 
+	router.GET("/ws", func(c *gin.Context) {
+		serveWs(hub, c)
+	})
+
 	// Routes protégées par JWT
 	protected := router.Group("/api")
 	protected.Use(middleware.AuthMiddleware())
@@ -44,7 +55,26 @@ func main() {
 		protected.GET("/tables/:id", controllers.GetTable)
 		protected.POST("/join/:id", controllers.JoinTable)
 		protected.GET("/tables", controllers.ListTables)
+		protected.DELETE("/tables/:id/leave", controllers.LeaveTable)
+		protected.POST("/logout", controllers.Logout)
 	}
 
 	router.Run("localhost:8080")
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true }, // A configurer pour la production
+}
+
+func serveWs(hub *Hub, c *gin.Context) {
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		return
+	}
+	client := &Client{conn: conn, send: make(chan []byte, 256)}
+	hub.register <- client
+
+	// Lancer les goroutines de lecture et d'écriture
+	go client.writePump()
+	go client.readPump(hub)
 }

@@ -82,6 +82,9 @@ func CreateTable(c *gin.Context) {
 		return
 	}
 
+	// Notifier tous les clients (via WebSocket) que la liste des tables a changé
+	database.PublishTablesReload()
+
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Table created successfully",
 		"table":   table,
@@ -180,4 +183,66 @@ func ListTables(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"tables": tables})
+}
+
+func LeaveTable(c *gin.Context) {
+	tableID := c.Param("id")
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	key := "table:" + tableID
+	val, err := database.RedisClient.Get(database.Ctx, key).Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Table not found"})
+		return
+	}
+
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
+		return
+	}
+
+	// Supprimer l'utilisateur de la liste des joueurs
+	newPlayers := []uint{}
+	for _, playerID := range table.Players {
+		if playerID != userID.(uint) {
+			newPlayers = append(newPlayers, playerID)
+		}
+	}
+	table.Players = newPlayers
+
+	// Si plus aucun joueur, supprimer la table
+	if len(table.Players) == 0 {
+		err := database.RedisClient.Del(database.Ctx, key).Err()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete table"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
+
+		// Notifier la mise à jour
+		database.PublishTablesReload()
+		return
+	}
+
+	// Mettre à jour la table dans Redis
+	updatedJSON, err := json.Marshal(table)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
+		return
+	}
+	err = database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
+		return
+	}
+
+	// Notifier la mise à jour
+	database.PublishTablesReload()
+
+	c.JSON(http.StatusOK, gin.H{"message": "Left table successfully"})
 }

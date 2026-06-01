@@ -2,7 +2,9 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"lekatika-server/models"
 	"log"
 	"os"
 
@@ -41,4 +43,27 @@ func ConnectRedis() {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 	fmt.Println("Redis connected successfully")
+}
+
+type TableEvent struct {
+	Type  string              `json:"type"`
+	Table models.PlayingTable `json:"table"`
+}
+
+// func PublishTableCreated(table models.PlayingTable) {
+// 	event := TableEvent{
+// 		Type:  "NEW_TABLE",
+// 		Table: table,
+// 	}
+// 	eventJSON, _ := json.Marshal(event)
+// 	// Publie l'événement sur le canal "tables"
+// 	RedisClient.Publish(Ctx, "tables", eventJSON)
+// }
+
+func PublishTablesReload() {
+	event := map[string]string{
+		"type": "RELOAD_TABLES",
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
