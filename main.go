@@ -3,7 +3,7 @@ package main
 import (
 	"lekatika-server/controllers"
 	"lekatika-server/database"
-
+	"lekatika-server/middleware" // À créer
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -11,15 +11,16 @@ import (
 )
 
 func main() {
-	// Connexion à la base de données
+	// Connexion à PostgreSQL
 	database.Connect()
+	// Connexion à Redis
+	database.ConnectRedis()
 
-	// Initialisation du routeur Gin
 	router := gin.Default()
 
-	// Configuration CORS (à placer avant vos routes)
+	// CORS (inchangé)
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:5173"}, // Votre frontend (modifiable selon vos besoins)
+		AllowOrigins:     []string{"http://localhost:5173"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -27,13 +28,23 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
-	// Groupe de routes d'authentification
+	// Routes publiques (authentification)
 	authGroup := router.Group("/api/auth")
 	{
 		authGroup.POST("/register", controllers.Register)
 		authGroup.POST("/login", controllers.Login)
 	}
 
-	// Démarrage du serveur
+	// Routes protégées par JWT
+	protected := router.Group("/api")
+	protected.Use(middleware.AuthMiddleware())
+	{
+		protected.GET("/user/me", controllers.GetCurrentUser)
+		protected.POST("/tables", controllers.CreateTable)
+		protected.GET("/tables/:id", controllers.GetTable)
+		protected.POST("/join/:id", controllers.JoinTable)
+		protected.GET("/tables", controllers.ListTables)
+	}
+
 	router.Run("localhost:8080")
 }

@@ -1,11 +1,14 @@
 package controllers
 
 import (
+	"fmt"
 	"lekatika-server/database"
 	"lekatika-server/models"
 	"net/http"
 	"os"
 	"time"
+
+	"encoding/json"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -84,6 +87,34 @@ func Login(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
+	}
+
+	// Stocker l'utilisateur dans Redis avec une expiration de 72h (comme le token)
+	userData := map[string]interface{}{
+		"id":                 user.ID,
+		"username":           user.Username,
+		"email":              user.Email,
+		"freeChipsAmount":    user.FreeChipsAmount,
+		"realChipsAmount":    user.RealChipsAmount,
+		"profilePictureLink": user.ProfilePictureLink,
+		"lastModification":   user.LastModification,
+		"playingTableId":     user.PlayingTableID,
+		"personalDetailsId":  user.PersonalDetailsID,
+		"paymentDetailsId":   user.PaymentDetailsID,
+	}
+
+	userJSON, err := json.Marshal(userData)
+	if err != nil {
+		// On log l'erreur mais on ne bloque pas la connexion
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize user data"})
+		return
+	}
+
+	// Clé Redis : "user:{id}"
+	err = database.RedisClient.Set(database.Ctx, fmt.Sprintf("user:%d", user.ID), userJSON, 72*time.Hour).Err()
+	if err != nil {
+		// Log l'erreur mais continue (non bloquant)
+		fmt.Printf("Failed to store user in Redis: %v\n", err)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
