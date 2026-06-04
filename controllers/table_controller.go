@@ -16,6 +16,7 @@ type CreateTableInput struct {
 	Name        string `json:"name"` // Nouveau
 	IsPrivate   bool   `json:"is_private"`
 	IsRealMoney bool   `json:"is_real_money"`
+	Paid33      bool   `json:"paid_33"`
 	Bet         int    `json:"bet"`
 }
 
@@ -42,6 +43,7 @@ func CreateTable(c *gin.Context) {
 		CreatedBy:         userID.(uint),
 		IsPrivate:         input.IsPrivate,
 		IsRealMoney:       input.IsRealMoney,
+		Paid33:            input.Paid33,
 		Bet:               input.Bet,
 		Status:            "waiting",
 		Players:           []uint{userID.(uint)},
