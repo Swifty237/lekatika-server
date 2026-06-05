@@ -248,3 +248,28 @@ func LeaveTable(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "Left table successfully"})
 }
+
+func GetTablesForUser(userID uint) ([]string, error) {
+	var tableIDs []string
+	keys, err := database.RedisClient.Keys(database.Ctx, "table:*").Result()
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		val, err := database.RedisClient.Get(database.Ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		var table models.PlayingTable
+		if err := json.Unmarshal([]byte(val), &table); err != nil {
+			continue
+		}
+		for _, player := range table.Players {
+			if player == userID {
+				tableIDs = append(tableIDs, table.ID)
+				break
+			}
+		}
+	}
+	return tableIDs, nil
+}

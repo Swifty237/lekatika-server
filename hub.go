@@ -9,8 +9,9 @@ import (
 )
 
 type Client struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn   *websocket.Conn
+	send   chan []byte
+	userID uint // ID de l'utilisateur
 }
 
 type Hub struct {

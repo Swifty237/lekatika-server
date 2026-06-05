@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"lekatika-server/controllers"
 	"lekatika-server/database"
 	"lekatika-server/middleware" // À créer
+	"lekatika-server/utils"
 	"time"
 
 	"net/http"
@@ -67,14 +69,38 @@ var upgrader = websocket.Upgrader{
 }
 
 func serveWs(hub *Hub, c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
+		return
+	}
+	userID, err := utils.ValidateToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
+		return
+	}
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
-	client := &Client{conn: conn, send: make(chan []byte, 256)}
+	client := &Client{
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		userID: userID,
+	}
 	hub.register <- client
 
-	// Lancer les goroutines de lecture et d'écriture
+	// Envoyer les tables à reconnecter
+	tableIDs, err := controllers.GetTablesForUser(userID)
+	if err == nil && len(tableIDs) > 0 {
+		msg := map[string]interface{}{
+			"type":     "RECONNECT_TABLES",
+			"tableIds": tableIDs,
+		}
+		data, _ := json.Marshal(msg)
+		client.send <- data
+	}
+
 	go client.writePump()
 	go client.readPump(hub)
 }
