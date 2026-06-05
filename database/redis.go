@@ -67,3 +67,12 @@ func PublishTablesReload() {
 	eventJSON, _ := json.Marshal(event)
 	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
+
+func PublishTableUpdate(tableID string) {
+	event := map[string]string{
+		"type":    "TABLE_UPDATED",
+		"tableId": tableID,
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
+}

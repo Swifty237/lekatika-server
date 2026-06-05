@@ -6,6 +6,7 @@ import (
 	"lekatika-server/database"
 	"lekatika-server/models"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -48,7 +49,7 @@ func CreateTable(c *gin.Context) {
 		Status:            "waiting",
 		Players:           []uint{userID.(uint)},
 		CreatedAt:         time.Now(),
-		Seats:             []uint{},
+		Seats:             []uint{0, 0, 0, 0},
 		Dealer:            "",
 		Turn:              "",
 		LastWinningSeat:   "",
@@ -208,7 +209,15 @@ func LeaveTable(c *gin.Context) {
 		return
 	}
 
-	// Supprimer l'utilisateur de la liste des joueurs
+	// 1. Libérer le siège si l'utilisateur était assis
+	for i, uid := range table.Seats {
+		if uid == userID.(uint) {
+			table.Seats[i] = 0
+			break
+		}
+	}
+
+	// 2. Supprimer l'utilisateur de la liste des joueurs
 	newPlayers := []uint{}
 	for _, playerID := range table.Players {
 		if playerID != userID.(uint) {
@@ -217,7 +226,7 @@ func LeaveTable(c *gin.Context) {
 	}
 	table.Players = newPlayers
 
-	// Si plus aucun joueur, supprimer la table
+	// 3. Si plus aucun joueur, supprimer la table
 	if len(table.Players) == 0 {
 		err := database.RedisClient.Del(database.Ctx, key).Err()
 		if err != nil {
@@ -225,13 +234,12 @@ func LeaveTable(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
-
-		// Notifier la mise à jour
 		database.PublishTablesReload()
+		database.PublishTableUpdate(tableID)
 		return
 	}
 
-	// Mettre à jour la table dans Redis
+	// 4. Sauvegarder la table mise à jour (avec siège libéré)
 	updatedJSON, err := json.Marshal(table)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
@@ -243,8 +251,9 @@ func LeaveTable(c *gin.Context) {
 		return
 	}
 
-	// Notifier la mise à jour
+	// 5. Notifier les clients
 	database.PublishTablesReload()
+	database.PublishTableUpdate(tableID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Left table successfully"})
 }
@@ -272,4 +281,127 @@ func GetTablesForUser(userID uint) ([]string, error) {
 		}
 	}
 	return tableIDs, nil
+}
+
+func SitAtTable(c *gin.Context) {
+	tableID := c.Param("id")
+	seatIDStr := c.Param("seatId")
+	seatIndex, err := strconv.Atoi(seatIDStr)
+	if err != nil || seatIndex < 1 || seatIndex > 4 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid seat number"})
+		return
+	}
+	seatIndex-- // 0-based
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	key := "table:" + tableID
+	val, err := database.RedisClient.Get(database.Ctx, key).Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Table not found"})
+		return
+	}
+
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
+		return
+	}
+
+	// Vérifier si l'utilisateur n'est pas déjà assis ailleurs
+	for i, uid := range table.Seats {
+		if uid == userID.(uint) {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Already seated at seat %d", i+1)})
+			return
+		}
+	}
+
+	// Vérifier si le siège est libre
+	if len(table.Seats) < seatIndex+1 {
+		// Agrandir le tableau si nécessaire (devrait déjà avoir 4 éléments)
+		for len(table.Seats) <= seatIndex {
+			table.Seats = append(table.Seats, 0)
+		}
+	}
+	if table.Seats[seatIndex] != 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Seat already taken"})
+		return
+	}
+
+	// Asseoir l'utilisateur
+	table.Seats[seatIndex] = userID.(uint)
+
+	// Sauvegarder
+	updatedJSON, err := json.Marshal(table)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
+		return
+	}
+	err = database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
+		return
+	}
+
+	// Notifier les clients
+	database.PublishTableUpdate(tableID)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Seated successfully", "table": table})
+}
+
+func UnseatFromTable(c *gin.Context) {
+	tableID := c.Param("id")
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	key := "table:" + tableID
+	val, err := database.RedisClient.Get(database.Ctx, key).Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Table not found"})
+		return
+	}
+
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
+		return
+	}
+
+	// Chercher le siège occupé par l'utilisateur
+	found := false
+	for i, uid := range table.Seats {
+		if uid == userID.(uint) {
+			table.Seats[i] = 0
+			found = true
+			break
+		}
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not seated at this table"})
+		return
+	}
+
+	// Sauvegarder la table mise à jour
+	updatedJSON, err := json.Marshal(table)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
+		return
+	}
+	err = database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
+		return
+	}
+
+	// Notifier tous les clients (WebSocket) de la mise à jour
+	database.PublishTableUpdate(tableID)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Unseated successfully", "table": table})
 }

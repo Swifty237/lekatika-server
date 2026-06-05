@@ -59,6 +59,8 @@ func main() {
 		protected.GET("/tables", controllers.ListTables)
 		protected.DELETE("/tables/:id/leave", controllers.LeaveTable)
 		protected.POST("/logout", controllers.Logout)
+		protected.POST("/tables/:id/sit/:seatId", controllers.SitAtTable)
+		protected.POST("/tables/:id/unseat", controllers.UnseatFromTable)
 	}
 
 	router.Run("localhost:8080")
