@@ -4,6 +4,11 @@ import (
 	"time"
 )
 
+type Seat struct {
+	UserID        int `json:"user_id"`
+	AmountAtStake int `json:"amount_at_stake"`
+}
+
 type PlayingTable struct {
 	ID                string    `json:"id"`
 	Name              string    `json:"name"` // Nouveau champ
@@ -14,8 +19,10 @@ type PlayingTable struct {
 	Bet               int       `json:"bet"`
 	Status            string    `json:"status"`
 	Players           []uint    `json:"players"`
+	PlayerUsernames   []string  `json:"player_usernames"`
 	CreatedAt         time.Time `json:"created_at"`
-	Seats             []uint    `json:"seats"`
+	Seats             []Seat    `json:"seats"`
+	SeatsConnected    []bool    `json:"seatsConnected"` // true = connecté, false = déconnecté
 	Dealer            string    `json:"dealer"`
 	Turn              string    `json:"turn"`
 	LastWinningSeat   string    `json:"last_winning_seat"` // Pour garder une trace du dernier gagnant
@@ -36,4 +43,5 @@ type PlayingTable struct {
 	OnTurnChanged     []string  `json:"on_turn_changed"`    // Callback pour notifier du changement de tour
 	ChatRoom          []string  `json:"chat_room"`
 	InviteLink        string    `json:"invite_link"`
+	DisconnectedAt    []int64   `json:"disconnected_at"` // 0 = connecté
 }

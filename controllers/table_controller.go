@@ -38,6 +38,11 @@ func CreateTable(c *gin.Context) {
 	tableID := uuid.New().String()
 	inviteLink := fmt.Sprintf("/join/%s", tableID)
 
+	seat1 := models.Seat{}
+	seat2 := models.Seat{}
+	seat3 := models.Seat{}
+	seat4 := models.Seat{}
+
 	table := models.PlayingTable{
 		ID:                tableID,
 		Name:              input.Name, // ← utilisation
@@ -48,8 +53,10 @@ func CreateTable(c *gin.Context) {
 		Bet:               input.Bet,
 		Status:            "waiting",
 		Players:           []uint{userID.(uint)},
+		PlayerUsernames:   []string{},
 		CreatedAt:         time.Now(),
-		Seats:             []uint{0, 0, 0, 0},
+		Seats:             []models.Seat{seat1, seat2, seat3, seat4},
+		SeatsConnected:    []bool{false, false, false, false}, // initialement tous déconnectés (siège vide)
 		Dealer:            "",
 		Turn:              "",
 		LastWinningSeat:   "",
@@ -70,6 +77,7 @@ func CreateTable(c *gin.Context) {
 		OnTurnChanged:     []string{},
 		ChatRoom:          []string{},
 		InviteLink:        inviteLink,
+		DisconnectedAt:    []int64{0, 0, 0, 0},
 	}
 
 	// Stocker dans Redis (clé: table:{ID})
@@ -84,6 +92,12 @@ func CreateTable(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
 		return
 	}
+
+	// Mettre à jour l'utilisateur dans Redis : ajouter cette table à sa liste
+	AddTableToUser(userID.(uint), tableID)
+
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
 
 	// Notifier tous les clients (via WebSocket) que la liste des tables a changé
 	database.PublishTablesReload()
@@ -109,6 +123,9 @@ func GetTable(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
 		return
 	}
+
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
 
 	c.JSON(http.StatusOK, gin.H{"table": table})
 }
@@ -149,6 +166,9 @@ func JoinTable(c *gin.Context) {
 		table.Players = append(table.Players, userID.(uint))
 	}
 
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
+
 	// 4. Sauvegarder la table mise à jour dans Redis
 	updatedTableJSON, err := json.Marshal(table)
 	if err != nil {
@@ -161,6 +181,9 @@ func JoinTable(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
 		return
 	}
+
+	// Mettre à jour l'utilisateur dans Redis : ajouter cette table à sa liste
+	AddTableToUser(userID.(uint), tableID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Joined table successfully", "table": table})
 }
@@ -210,9 +233,10 @@ func LeaveTable(c *gin.Context) {
 	}
 
 	// 1. Libérer le siège si l'utilisateur était assis
-	for i, uid := range table.Seats {
-		if uid == userID.(uint) {
-			table.Seats[i] = 0
+	for i, seat := range table.Seats {
+		if seat.UserID == int(userID.(uint)) {
+			table.Seats[i].UserID = 0
+			table.SeatsConnected[i] = false
 			break
 		}
 	}
@@ -226,6 +250,9 @@ func LeaveTable(c *gin.Context) {
 	}
 	table.Players = newPlayers
 
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
+
 	// 3. Si plus aucun joueur, supprimer la table
 	if len(table.Players) == 0 {
 		err := database.RedisClient.Del(database.Ctx, key).Err()
@@ -234,6 +261,9 @@ func LeaveTable(c *gin.Context) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
+
+		RemoveTableFromUser(userID.(uint), tableID)
+
 		database.PublishTablesReload()
 		database.PublishTableUpdate(tableID)
 		return
@@ -313,27 +343,31 @@ func SitAtTable(c *gin.Context) {
 	}
 
 	// Vérifier si l'utilisateur n'est pas déjà assis ailleurs
-	for i, uid := range table.Seats {
-		if uid == userID.(uint) {
+	for i, seat := range table.Seats {
+		if seat.UserID == int(userID.(uint)) {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Already seated at seat %d", i+1)})
 			return
 		}
 	}
 
-	// Vérifier si le siège est libre
-	if len(table.Seats) < seatIndex+1 {
-		// Agrandir le tableau si nécessaire (devrait déjà avoir 4 éléments)
-		for len(table.Seats) <= seatIndex {
-			table.Seats = append(table.Seats, 0)
-		}
+	// Vérifier que l'indice du siège existe
+	if seatIndex >= len(table.Seats) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Seat index out of range"})
+		return
 	}
-	if table.Seats[seatIndex] != 0 {
+
+	// Vérifier si le siège est libre
+	if table.Seats[seatIndex].UserID != 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Seat already taken"})
 		return
 	}
 
 	// Asseoir l'utilisateur
-	table.Seats[seatIndex] = userID.(uint)
+	table.Seats[seatIndex].UserID = int(userID.(uint))
+	table.SeatsConnected[seatIndex] = true
+
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
 
 	// Sauvegarder
 	updatedJSON, err := json.Marshal(table)
@@ -376,9 +410,14 @@ func UnseatFromTable(c *gin.Context) {
 
 	// Chercher le siège occupé par l'utilisateur
 	found := false
-	for i, uid := range table.Seats {
-		if uid == userID.(uint) {
-			table.Seats[i] = 0
+	for i, seat := range table.Seats {
+		if seat.UserID == int(userID.(uint)) {
+			table.Seats[i].UserID = 0
+			table.SeatsConnected[i] = false
+
+			usernames, _ := fetchUsernames(table.Players)
+			table.PlayerUsernames = usernames
+
 			found = true
 			break
 		}
@@ -404,4 +443,24 @@ func UnseatFromTable(c *gin.Context) {
 	database.PublishTableUpdate(tableID)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Unseated successfully", "table": table})
+}
+
+// fetchUsernames retourne les noms des joueurs à partir de leurs IDs (depuis Redis)
+func fetchUsernames(userIDs []uint) ([]string, error) {
+	usernames := make([]string, len(userIDs))
+	for i, id := range userIDs {
+		key := fmt.Sprintf("user:%d", id)
+		val, err := database.RedisClient.Get(database.Ctx, key).Result()
+		if err != nil {
+			usernames[i] = fmt.Sprintf("Joueur %d", id)
+			continue
+		}
+		var user models.UserRedis
+		if err := json.Unmarshal([]byte(val), &user); err != nil {
+			usernames[i] = fmt.Sprintf("Joueur %d", id)
+			continue
+		}
+		usernames[i] = user.Username
+	}
+	return usernames, nil
 }

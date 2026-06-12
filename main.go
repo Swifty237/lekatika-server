@@ -5,7 +5,9 @@ import (
 	"lekatika-server/controllers"
 	"lekatika-server/database"
 	"lekatika-server/middleware" // À créer
+	"lekatika-server/models"
 	"lekatika-server/utils"
+	"log"
 	"time"
 
 	"net/http"
@@ -24,6 +26,15 @@ func main() {
 	hub := NewHub()
 	go hub.Run()
 	go hub.subscribeToRedis() // <-- nouvelle goroutine
+
+	// Démarrer la goroutine de nettoyage des déconnexions
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			CheckDisconnectedTables()
+		}
+	}()
 
 	router := gin.Default()
 
@@ -92,6 +103,9 @@ func serveWs(hub *Hub, c *gin.Context) {
 	}
 	hub.register <- client
 
+	// Marquer connecté
+	controllers.MarkUserConnected(userID)
+
 	// Envoyer les tables à reconnecter
 	tableIDs, err := controllers.GetTablesForUser(userID)
 	if err == nil && len(tableIDs) > 0 {
@@ -105,4 +119,56 @@ func serveWs(hub *Hub, c *gin.Context) {
 
 	go client.writePump()
 	go client.readPump(hub)
+}
+
+func CheckDisconnectedTables() {
+	keys, err := database.RedisClient.Keys(database.Ctx, "table:*").Result()
+	if err != nil {
+		return
+	}
+	now := time.Now().Unix()
+	for _, key := range keys {
+		val, err := database.RedisClient.Get(database.Ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		var table models.PlayingTable
+		if err := json.Unmarshal([]byte(val), &table); err != nil {
+			continue
+		}
+		updated := false
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && !table.SeatsConnected[i] && table.DisconnectedAt[i] != 0 && now-table.DisconnectedAt[i] > 60 {
+				userID := uint(seat.UserID)
+				log.Printf("Expelling player %d from table %s seat %d", userID, table.ID, i+1)
+				table.Seats[i].UserID = 0
+				table.SeatsConnected[i] = false
+				table.DisconnectedAt[i] = 0
+				// Retirer des players
+				newPlayers := []uint{}
+				for _, p := range table.Players {
+					if p != userID {
+						newPlayers = append(newPlayers, p)
+					}
+				}
+				table.Players = newPlayers
+				updated = true
+			}
+		}
+		if updated {
+			// Si plus aucun joueur, supprimer la table
+			if len(table.Players) == 0 {
+				database.RedisClient.Del(database.Ctx, key)
+				database.PublishTablesReload()
+				log.Printf("Table %s deleted because no players left", table.ID)
+				continue
+			}
+			// Sauvegarder la table mise à jour
+			updatedJSON, _ := json.Marshal(table)
+			database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour)
+			database.PublishTableUpdate(table.ID)
+			database.PublishTablesReload() // ← force le rafraîchissement du lobby
+			log.Printf("Table %s updated after expulsion", table.ID)
+		}
+	}
 }

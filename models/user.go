@@ -15,21 +15,27 @@ type User struct {
 	Password string `json:"-"` // jamais exposé en JSON
 
 	// Nouveaux champs nullables (pointeurs)
-	SocketId           *string   `json:"socketId,omitempty"`                     // nul à la création
-	FreeChipsAmount    *float64  `json:"freeChipsAmount,omitempty"`              // entier avec virgule, nul
-	RealChipsAmount    *float64  `json:"realChipsAmount,omitempty"`              // entier avec virgule, nul
-	ProfilePictureLink *string   `json:"profilePictureLink,omitempty"`           // nul
-	LastModification   time.Time `gorm:"autoUpdateTime" json:"lastModification"` // mis à jour automatiquement
+	// SocketId                *string   `json:"socketId,omitempty"`                     // nul à la création
+	FreeChipsAmountBankroll *float64  `json:"free_chips_amount_bankroll,omitempty"`    // entier avec virgule, nul
+	RealChipsAmountBankroll *float64  `json:"real_chips_amount_bankroll,omitempty"`    // entier avec virgule, nul
+	ProfilePictureLink      *string   `json:"profile_picture_link,omitempty"`          // nul
+	LastModification        time.Time `gorm:"autoUpdateTime" json:"last_modification"` // mis à jour automatiquement
+}
 
-	// Clés étrangères pour les relations (valeurs nulles tant que non définies)
-	PlayingTableID    *uint `json:"playingTableId,omitempty"`
-	PersonalDetailsID *uint `json:"personalDetailsId,omitempty"`
-	PaymentDetailsID  *uint `json:"paymentDetailsId,omitempty"`
+type UserRedis struct {
+	gorm.Model
+	// Champs existants
+	Username string `gorm:"unique;not null" json:"username"`
+	Email    string `gorm:"unique;not null" json:"email"`
+	Password string `json:"-"` // jamais exposé en JSON
 
-	// Relations (à décommenter quand les modèles existent)
-	// PlayingTable      *PlayingTable   `gorm:"foreignKey:PlayingTableID"`
-	// PersonalDetails   *PersonalDetail `gorm:"foreignKey:PersonalDetailsID"`
-	// PaymentDetails    *PaymentDetail  `gorm:"foreignKey:PaymentDetailsID"`
+	// Nouveaux champs nullables (pointeurs)
+	// SocketId                *string   `json:"socketId,omitempty"`                     // nul à la création
+	FreeChipsAmountBankroll *float64  `json:"free_chips_amount_bankroll,omitempty"`    // entier avec virgule, nul
+	RealChipsAmountBankroll *float64  `json:"real_chips_amount_bankroll,omitempty"`    // entier avec virgule, nul
+	ProfilePictureLink      *string   `json:"profile_picture_link,omitempty"`          // nul
+	LastModification        time.Time `gorm:"autoUpdateTime" json:"last_modification"` // mis à jour automatiquement
+	PlayingTableIDs         []string  `json:"playing_table_ids"`
 }
 
 // HashPassword hashe le mot de passe

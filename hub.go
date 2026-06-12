@@ -3,6 +3,7 @@ package main
 import (
 	"sync"
 
+	"lekatika-server/controllers"
 	"lekatika-server/database" // ← Import du package database pour Redis
 
 	"github.com/gorilla/websocket"
@@ -85,6 +86,7 @@ func (c *Client) writePump() {
 // readPump lit les messages de la connexion WebSocket (pour la maintenir vivante)
 func (c *Client) readPump(hub *Hub) {
 	defer func() {
+		controllers.MarkUserDisconnected(c.userID) // <- ajout
 		hub.unregister <- c
 		c.conn.Close()
 	}()

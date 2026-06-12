@@ -12,13 +12,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"gorm.io/gorm"
 )
 
 type RegisterInput struct {
-	Username        string   `json:"username" binding:"required"`
-	Email           string   `json:"email" binding:"required,email"`
-	Password        string   `json:"password" binding:"required,min=6"`
-	FreeChipsAmount *float64 `json:"freeChipsAmount,omitempty"`
+	Username                string   `json:"username" binding:"required"`
+	Email                   string   `json:"email" binding:"required,email"`
+	Password                string   `json:"password" binding:"required,min=6"`
+	FreeChipsAmountBankroll *float64 `json:"free_chips_amount_bankroll,omitempty"`
 }
 
 type LoginInput struct {
@@ -42,9 +43,9 @@ func Register(c *gin.Context) {
 
 	// Créer un nouvel utilisateur
 	user := models.User{
-		Username:        input.Username,
-		Email:           input.Email,
-		FreeChipsAmount: input.FreeChipsAmount,
+		Username:                input.Username,
+		Email:                   input.Email,
+		FreeChipsAmountBankroll: input.FreeChipsAmountBankroll,
 	}
 	if err := user.HashPassword(input.Password); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
@@ -82,30 +83,28 @@ func Login(c *gin.Context) {
 		"user_id": user.ID,
 		"exp":     time.Now().Add(time.Hour * 72).Unix(),
 	})
-
 	tokenString, err := token.SignedString([]byte(os.Getenv("JWT_SECRET")))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
 		return
 	}
 
-	// Stocker l'utilisateur dans Redis avec une expiration de 72h (comme le token)
-	userData := map[string]interface{}{
-		"id":                 user.ID,
-		"username":           user.Username,
-		"email":              user.Email,
-		"freeChipsAmount":    user.FreeChipsAmount,
-		"realChipsAmount":    user.RealChipsAmount,
-		"profilePictureLink": user.ProfilePictureLink,
-		"lastModification":   user.LastModification,
-		"playingTableId":     user.PlayingTableID,
-		"personalDetailsId":  user.PersonalDetailsID,
-		"paymentDetailsId":   user.PaymentDetailsID,
+	// Créer l'objet UserRedis pour le cache
+	userRedis := models.UserRedis{
+		// hérite des champs de gorm.Model (ID, CreatedAt, UpdatedAt, DeletedAt)
+		// mais nous n'avons pas ces champs dans la réponse JSON. On met juste l'ID.
+		Model:                   gorm.Model{ID: user.ID},
+		Username:                user.Username,
+		Email:                   user.Email,
+		FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
+		RealChipsAmountBankroll: user.RealChipsAmountBankroll,
+		ProfilePictureLink:      user.ProfilePictureLink,
+		LastModification:        user.LastModification,
+		PlayingTableIDs:         []string{}, // slice vide pour l'instant
 	}
 
-	userJSON, err := json.Marshal(userData)
+	userJSON, err := json.Marshal(userRedis)
 	if err != nil {
-		// On log l'erreur mais on ne bloque pas la connexion
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize user data"})
 		return
 	}
@@ -113,7 +112,6 @@ func Login(c *gin.Context) {
 	// Clé Redis : "user:{id}"
 	err = database.RedisClient.Set(database.Ctx, fmt.Sprintf("user:%d", user.ID), userJSON, 72*time.Hour).Err()
 	if err != nil {
-		// Log l'erreur mais continue (non bloquant)
 		fmt.Printf("Failed to store user in Redis: %v\n", err)
 	}
 
@@ -121,16 +119,14 @@ func Login(c *gin.Context) {
 		"message": "Login successful",
 		"token":   tokenString,
 		"user": gin.H{
-			"id":                 user.ID,
-			"username":           user.Username,
-			"email":              user.Email,
-			"freeChipsAmount":    user.FreeChipsAmount,
-			"realChipsAmount":    user.RealChipsAmount,
-			"profilePictureLink": user.ProfilePictureLink,
-			"lastModification":   user.LastModification,
-			"playingTableId":     user.PlayingTableID,
-			"personalDetailsId":  user.PersonalDetailsID,
-			"paymentDetailsId":   user.PaymentDetailsID,
+			"user_id":                    user.ID,
+			"username":                   user.Username,
+			"email":                      user.Email,
+			"free_chips_amount_bankroll": user.FreeChipsAmountBankroll,
+			"real_chips_amount_bankroll": user.RealChipsAmountBankroll,
+			"profile_picture_link":       user.ProfilePictureLink,
+			"last_modification":          user.LastModification,
+			"playing_table_ids":          userRedis.PlayingTableIDs,
 		},
 	})
 }

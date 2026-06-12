@@ -50,16 +50,6 @@ type TableEvent struct {
 	Table models.PlayingTable `json:"table"`
 }
 
-// func PublishTableCreated(table models.PlayingTable) {
-// 	event := TableEvent{
-// 		Type:  "NEW_TABLE",
-// 		Table: table,
-// 	}
-// 	eventJSON, _ := json.Marshal(event)
-// 	// Publie l'événement sur le canal "tables"
-// 	RedisClient.Publish(Ctx, "tables", eventJSON)
-// }
-
 func PublishTablesReload() {
 	event := map[string]string{
 		"type": "RELOAD_TABLES",
