@@ -11,7 +11,12 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
+
+type SitInput struct {
+	Amount int `json:"amount"`
+}
 
 type CreateTableInput struct {
 	Name        string `json:"name"` // Nouveau
@@ -232,13 +237,38 @@ func LeaveTable(c *gin.Context) {
 		return
 	}
 
-	// 1. Libérer le siège si l'utilisateur était assis
+	// 1. Restituer le montant misé si le joueur est assis
+	var seatAmount int
+	seatIndex := -1
 	for i, seat := range table.Seats {
 		if seat.UserID == int(userID.(uint)) {
-			table.Seats[i].UserID = 0
-			table.SeatsConnected[i] = false
+			seatAmount = seat.AmountAtStake
+			seatIndex = i
 			break
 		}
+	}
+	if seatAmount > 0 {
+		// Restituer à la bankroll (comme dans UnseatFromTable)
+		userKey := fmt.Sprintf("user:%d", userID)
+		userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+		if err == nil {
+			var userRedis models.UserRedis
+			if err := json.Unmarshal([]byte(userVal), &userRedis); err == nil {
+				if userRedis.FreeChipsAmountBankroll != nil {
+					newBankroll := *userRedis.FreeChipsAmountBankroll + float64(seatAmount)
+					userRedis.FreeChipsAmountBankroll = &newBankroll
+					updatedUserJSON, _ := json.Marshal(userRedis)
+					database.RedisClient.Set(database.Ctx, userKey, updatedUserJSON, 72*time.Hour)
+				}
+			}
+		}
+		database.DB.Model(&models.User{}).Where("id = ?", userID).
+			Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll + ?", seatAmount))
+	}
+	if seatIndex != -1 {
+		table.Seats[seatIndex].UserID = 0
+		table.Seats[seatIndex].AmountAtStake = 0
+		table.SeatsConnected[seatIndex] = false
 	}
 
 	// 2. Supprimer l'utilisateur de la liste des joueurs
@@ -255,21 +285,15 @@ func LeaveTable(c *gin.Context) {
 
 	// 3. Si plus aucun joueur, supprimer la table
 	if len(table.Players) == 0 {
-		err := database.RedisClient.Del(database.Ctx, key).Err()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete table"})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
-
+		database.RedisClient.Del(database.Ctx, key)
 		RemoveTableFromUser(userID.(uint), tableID)
-
 		database.PublishTablesReload()
 		database.PublishTableUpdate(tableID)
+		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
 		return
 	}
 
-	// 4. Sauvegarder la table mise à jour (avec siège libéré)
+	// 4. Sauvegarder la table mise à jour
 	updatedJSON, err := json.Marshal(table)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
@@ -284,7 +308,6 @@ func LeaveTable(c *gin.Context) {
 	// 5. Notifier les clients
 	database.PublishTablesReload()
 	database.PublishTableUpdate(tableID)
-
 	c.JSON(http.StatusOK, gin.H{"message": "Left table successfully"})
 }
 
@@ -329,6 +352,13 @@ func SitAtTable(c *gin.Context) {
 		return
 	}
 
+	var input SitInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing or invalid amount"})
+		return
+	}
+
+	// ---------- 1. Récupérer la table depuis Redis ----------
 	key := "table:" + tableID
 	val, err := database.RedisClient.Get(database.Ctx, key).Result()
 	if err != nil {
@@ -342,7 +372,7 @@ func SitAtTable(c *gin.Context) {
 		return
 	}
 
-	// Vérifier si l'utilisateur n'est pas déjà assis ailleurs
+	// Vérifications de base : siège libre, utilisateur déjà assis ailleurs, etc.
 	for i, seat := range table.Seats {
 		if seat.UserID == int(userID.(uint)) {
 			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("Already seated at seat %d", i+1)})
@@ -350,26 +380,80 @@ func SitAtTable(c *gin.Context) {
 		}
 	}
 
-	// Vérifier que l'indice du siège existe
-	if seatIndex >= len(table.Seats) {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Seat index out of range"})
-		return
-	}
-
-	// Vérifier si le siège est libre
-	if table.Seats[seatIndex].UserID != 0 {
+	if seatIndex >= len(table.Seats) || table.Seats[seatIndex].UserID != 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Seat already taken"})
 		return
 	}
 
-	// Asseoir l'utilisateur
+	// ---------- 2. Vérifier la bankroll de l'utilisateur ----------
+	// On récupère l'utilisateur depuis Redis (cache)
+	userKey := fmt.Sprintf("user:%d", userID)
+	userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+	var userRedis models.UserRedis
+	var bankroll *float64
+
+	if err == nil {
+		if err := json.Unmarshal([]byte(userVal), &userRedis); err == nil {
+			bankroll = userRedis.FreeChipsAmountBankroll
+		}
+	} else {
+		// Fallback : lire depuis PostgreSQL
+		var user models.User
+		if err := database.DB.First(&user, userID).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+			return
+		}
+		bankroll = user.FreeChipsAmountBankroll
+		// Reconstruire UserRedis pour le mettre à jour plus tard
+		userRedis = models.UserRedis{
+			Model:                   gorm.Model{ID: user.ID},
+			Username:                user.Username,
+			Email:                   user.Email,
+			FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
+			RealChipsAmountBankroll: user.RealChipsAmountBankroll,
+			ProfilePictureLink:      user.ProfilePictureLink,
+			LastModification:        user.LastModification,
+			PlayingTableIDs:         []string{}, // à charger si besoin
+		}
+	}
+
+	// Vérifier que la bankroll est suffisante
+	if bankroll == nil || *bankroll < float64(input.Amount) {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": "Insufficient chips"})
+		return
+	}
+
+	// ---------- 3. Déduire le montant de la bankroll ----------
+	newBankroll := *bankroll - float64(input.Amount)
+	userRedis.FreeChipsAmountBankroll = &newBankroll
+
+	// Mettre à jour Redis
+	updatedUserJSON, err := json.Marshal(userRedis)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize user"})
+		return
+	}
+	err = database.RedisClient.Set(database.Ctx, userKey, updatedUserJSON, 72*time.Hour).Err()
+	if err != nil {
+		fmt.Printf("Failed to update user in Redis: %v\n", err)
+	}
+
+	// (Optionnel) Mettre à jour PostgreSQL de manière asynchrone ou synchrone
+	// Pour éviter la complexité, on peut simplement mettre à jour la base maintenant.
+	// On utilise une requête atomique pour éviter les races conditions (mais ce n'est pas parfait)
+	// Version simple : mise à jour directe
+	if err := database.DB.Model(&models.User{}).Where("id = ? AND free_chips_amount_bankroll >= ?", userID, input.Amount).
+		Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll - ?", input.Amount)).Error; err != nil {
+		// Log l'erreur mais continue (car Redis est à jour)
+		fmt.Printf("Failed to update PostgreSQL bankroll: %v\n", err)
+	}
+
+	// ---------- 4. Asseoir l'utilisateur sur le siège ----------
 	table.Seats[seatIndex].UserID = int(userID.(uint))
+	table.Seats[seatIndex].AmountAtStake = input.Amount
 	table.SeatsConnected[seatIndex] = true
 
-	usernames, _ := fetchUsernames(table.Players)
-	table.PlayerUsernames = usernames
-
-	// Sauvegarder
+	// Sauvegarder la table mise à jour
 	updatedJSON, err := json.Marshal(table)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
@@ -409,25 +493,50 @@ func UnseatFromTable(c *gin.Context) {
 	}
 
 	// Chercher le siège occupé par l'utilisateur
-	found := false
+	var seatAmount int
+	seatIndex := -1
 	for i, seat := range table.Seats {
 		if seat.UserID == int(userID.(uint)) {
-			table.Seats[i].UserID = 0
-			table.SeatsConnected[i] = false
-
-			usernames, _ := fetchUsernames(table.Players)
-			table.PlayerUsernames = usernames
-
-			found = true
+			seatAmount = seat.AmountAtStake
+			seatIndex = i
 			break
 		}
 	}
-	if !found {
+	if seatIndex == -1 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not seated at this table"})
 		return
 	}
 
-	// Sauvegarder la table mise à jour
+	// Restituer le montant misé à la bankroll de l'utilisateur
+	if seatAmount > 0 {
+		// Récupérer l'utilisateur depuis Redis
+		userKey := fmt.Sprintf("user:%d", userID)
+		userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+		if err == nil {
+			var userRedis models.UserRedis
+			if err := json.Unmarshal([]byte(userVal), &userRedis); err == nil {
+				if userRedis.FreeChipsAmountBankroll != nil {
+					newBankroll := *userRedis.FreeChipsAmountBankroll + float64(seatAmount)
+					userRedis.FreeChipsAmountBankroll = &newBankroll
+					updatedUserJSON, _ := json.Marshal(userRedis)
+					database.RedisClient.Set(database.Ctx, userKey, updatedUserJSON, 72*time.Hour)
+				}
+			}
+		}
+		// Mettre à jour PostgreSQL
+		database.DB.Model(&models.User{}).Where("id = ?", userID).
+			Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll + ?", seatAmount))
+	}
+
+	// Libérer le siège
+	table.Seats[seatIndex].UserID = 0
+	table.Seats[seatIndex].AmountAtStake = 0
+	table.SeatsConnected[seatIndex] = false
+
+	usernames, _ := fetchUsernames(table.Players)
+	table.PlayerUsernames = usernames
+
+	// Sauvegarder la table
 	updatedJSON, err := json.Marshal(table)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
@@ -439,9 +548,7 @@ func UnseatFromTable(c *gin.Context) {
 		return
 	}
 
-	// Notifier tous les clients (WebSocket) de la mise à jour
 	database.PublishTableUpdate(tableID)
-
 	c.JSON(http.StatusOK, gin.H{"message": "Unseated successfully", "table": table})
 }
 

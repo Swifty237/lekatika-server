@@ -43,11 +43,15 @@ func Logout(c *gin.Context) {
 		return
 	}
 
+	// Retirer l'utilisateur de toutes les tables (libérer sièges, restituer jetons, etc.)
+	RemoveUserFromAllTables(userID.(uint))
+
+	// Supprimer l'entrée Redis de l'utilisateur
 	key := fmt.Sprintf("user:%d", userID)
 	err := database.RedisClient.Del(database.Ctx, key).Err()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user session"})
-		return
+		fmt.Printf("Failed to delete user from Redis: %v\n", err)
+		// On ne bloque pas la réponse, on log seulement
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully"})
