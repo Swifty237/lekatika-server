@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"sync"
 
 	"lekatika-server/controllers"
@@ -83,17 +84,41 @@ func (c *Client) writePump() {
 	c.conn.Close()
 }
 
-// readPump lit les messages de la connexion WebSocket (pour la maintenir vivante)
+// readPump lit les messages de la connexion WebSocket et les traite
 func (c *Client) readPump(hub *Hub) {
 	defer func() {
-		controllers.MarkUserDisconnected(c.userID) // <- ajout
+		controllers.MarkUserDisconnected(c.userID)
 		hub.unregister <- c
 		c.conn.Close()
 	}()
 	for {
-		_, _, err := c.conn.ReadMessage()
+		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			break
+		}
+		// Décoder le message JSON
+		var msg map[string]interface{}
+		if err := json.Unmarshal(message, &msg); err != nil {
+			continue
+		}
+		msgType, ok := msg["type"].(string)
+		if !ok {
+			continue
+		}
+		switch msgType {
+		case "SIT":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			if tableID != "" {
+				controllers.HandleSit(tableID, int(seatIdxFloat), c.userID)
+			}
+		case "PLAY_CARD":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			cardIdxFloat, _ := msg["cardIndex"].(float64)
+			if tableID != "" {
+				controllers.HandlePlayCard(tableID, int(seatIdxFloat), int(cardIdxFloat), c.userID)
+			}
 		}
 	}
 }

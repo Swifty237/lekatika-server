@@ -49,19 +49,25 @@ func CreateTable(c *gin.Context) {
 	seat4 := models.Seat{}
 
 	table := models.PlayingTable{
-		ID:                tableID,
-		Name:              input.Name, // ← utilisation
-		CreatedBy:         userID.(uint),
-		IsPrivate:         input.IsPrivate,
-		IsRealMoney:       input.IsRealMoney,
-		Paid33:            input.Paid33,
-		Bet:               input.Bet,
-		Status:            "waiting",
-		Players:           []uint{userID.(uint)},
-		PlayerUsernames:   []string{},
-		CreatedAt:         time.Now(),
-		Seats:             []models.Seat{seat1, seat2, seat3, seat4},
-		SeatsConnected:    []bool{false, false, false, false}, // initialement tous déconnectés (siège vide)
+		ID:              tableID,
+		Name:            input.Name, // ← utilisation
+		CreatedBy:       userID.(uint),
+		IsPrivate:       input.IsPrivate,
+		IsRealMoney:     input.IsRealMoney,
+		Paid33:          input.Paid33,
+		Bet:             input.Bet,
+		Status:          "waiting",
+		Players:         []uint{userID.(uint)},
+		PlayerUsernames: []string{},
+		CreatedAt:       time.Now(),
+		Seats:           []models.Seat{seat1, seat2, seat3, seat4},
+		SeatsConnected:  []bool{false, false, false, false}, // initialement tous déconnectés (siège vide)
+		SeatCards: []models.SeatCards{
+			{Hand: []string{}, Played: []string{}},
+			{Hand: []string{}, Played: []string{}},
+			{Hand: []string{}, Played: []string{}},
+			{Hand: []string{}, Played: []string{}},
+		},
 		Dealer:            "",
 		Turn:              "",
 		LastWinningSeat:   "",
@@ -264,6 +270,7 @@ func LeaveTable(c *gin.Context) {
 		}
 		database.DB.Model(&models.User{}).Where("id = ?", userID).
 			Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll + ?", seatAmount))
+
 	}
 	if seatIndex != -1 {
 		table.Seats[seatIndex].UserID = 0
