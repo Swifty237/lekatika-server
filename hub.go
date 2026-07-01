@@ -119,6 +119,13 @@ func (c *Client) readPump(hub *Hub) {
 			if tableID != "" {
 				controllers.HandlePlayCard(tableID, int(seatIdxFloat), int(cardIdxFloat), c.userID)
 			}
+
+		case "CHAT_MESSAGE":
+			tableID, _ := msg["tableId"].(string)
+			content, _ := msg["content"].(string)
+			if tableID != "" && content != "" {
+				controllers.HandleChatMessage(tableID, c.userID, content)
+			}
 		}
 	}
 }

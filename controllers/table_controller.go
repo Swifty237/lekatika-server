@@ -87,6 +87,7 @@ func CreateTable(c *gin.Context) {
 		WonByCombination:  false,
 		OnTurnChanged:     []string{},
 		ChatRoom:          []string{},
+		ChatMessages:      []models.ChatMessage{},
 		InviteLink:        inviteLink,
 		DisconnectedAt:    []int64{0, 0, 0, 0},
 	}
