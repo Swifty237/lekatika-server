@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"time"
 
+	"math/rand"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -68,7 +70,7 @@ func CreateTable(c *gin.Context) {
 			{Hand: []string{}, Played: []string{}},
 			{Hand: []string{}, Played: []string{}},
 		},
-		Dealer:            "",
+		DealerSeatIndex:   -1,
 		Turn:              "",
 		LastWinningSeat:   "",
 		LastRoundWinner:   "",
@@ -90,6 +92,8 @@ func CreateTable(c *gin.Context) {
 		ChatMessages:      []models.ChatMessage{},
 		InviteLink:        inviteLink,
 		DisconnectedAt:    []int64{0, 0, 0, 0},
+		Deck:              []string{},
+		GameStarted:       false,
 	}
 
 	// Stocker dans Redis (clé: table:{ID})
@@ -279,6 +283,33 @@ func LeaveTable(c *gin.Context) {
 		table.SeatsConnected[seatIndex] = false
 	}
 
+	if table.DealerSeatIndex == seatIndex {
+		newDealer := -1
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && i != seatIndex {
+				newDealer = i
+				break
+			}
+		}
+		table.DealerSeatIndex = newDealer
+	}
+
+	occupiedSeats := 0
+	for _, seat := range table.Seats {
+		if seat.UserID != 0 {
+			occupiedSeats++
+		}
+	}
+
+	if occupiedSeats < 2 {
+		table.GameStarted = false
+		table.Deck = []string{}
+		for i := range table.SeatCards {
+			table.SeatCards[i].Hand = []string{}
+			table.SeatCards[i].Played = []string{}
+		}
+	}
+
 	// 2. Supprimer l'utilisateur de la liste des joueurs
 	newPlayers := []uint{}
 	for _, playerID := range table.Players {
@@ -446,9 +477,6 @@ func SitAtTable(c *gin.Context) {
 		fmt.Printf("Failed to update user in Redis: %v\n", err)
 	}
 
-	// (Optionnel) Mettre à jour PostgreSQL de manière asynchrone ou synchrone
-	// Pour éviter la complexité, on peut simplement mettre à jour la base maintenant.
-	// On utilise une requête atomique pour éviter les races conditions (mais ce n'est pas parfait)
 	// Version simple : mise à jour directe
 	if err := database.DB.Model(&models.User{}).Where("id = ? AND free_chips_amount_bankroll >= ?", userID, input.Amount).
 		Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll - ?", input.Amount)).Error; err != nil {
@@ -458,11 +486,64 @@ func SitAtTable(c *gin.Context) {
 
 	// ---------- 4. Asseoir l'utilisateur sur le siège ----------
 	table.Seats[seatIndex].UserID = int(userID.(uint))
+
+	if table.DealerSeatIndex == -1 {
+		table.DealerSeatIndex = seatIndex
+	}
 	table.Seats[seatIndex].AmountAtStake = input.Amount
 	table.SeatsConnected[seatIndex] = true
 
+	occupiedSeats := 0
+	for _, seat := range table.Seats {
+		if seat.UserID != 0 {
+			occupiedSeats++
+		}
+	}
+
+	if occupiedSeats >= 2 {
+		// Si le jeu n'est pas encore commencé, initialiser le deck et distribuer à tous
+		if !table.GameStarted {
+			if len(table.Deck) == 0 {
+				table.Deck = createDeck()
+			}
+			// Distribuer 5 cartes à chaque siège occupé qui n'en a pas
+			for i, seat := range table.Seats {
+				if seat.UserID != 0 && len(table.SeatCards[i].Hand) == 0 {
+					hand := []string{}
+					for j := 0; j < 5 && len(table.Deck) > 0; j++ {
+						hand = append(hand, table.Deck[0])
+						table.Deck = table.Deck[1:]
+					}
+					table.SeatCards[i].Hand = hand
+					table.SeatCards[i].Played = []string{}
+				}
+			}
+			table.GameStarted = true
+		} else {
+			// La partie est déjà commencée : distribuer uniquement au nouveau joueur
+			if len(table.SeatCards[seatIndex].Hand) == 0 {
+				// Vérifier s'il reste assez de cartes dans le deck
+				if len(table.Deck) >= 5 {
+					hand := []string{}
+					for j := 0; j < 5; j++ {
+						hand = append(hand, table.Deck[0])
+						table.Deck = table.Deck[1:]
+					}
+					table.SeatCards[seatIndex].Hand = hand
+					table.SeatCards[seatIndex].Played = []string{}
+				} else {
+					// Optionnel : si le deck est vide, on pourrait recréer un deck, mais cela dupliquerait les cartes
+					// Pour l'instant, on ne fait rien ou on distribue ce qui reste
+					// On peut aussi envoyer une erreur indiquant qu'il n'y a plus de cartes
+					// Mais pour l'instant, on ignore
+				}
+			}
+		}
+	}
+
 	// Sauvegarder la table mise à jour
 	updatedJSON, err := json.Marshal(table)
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
 		return
@@ -541,6 +622,33 @@ func UnseatFromTable(c *gin.Context) {
 	table.Seats[seatIndex].AmountAtStake = 0
 	table.SeatsConnected[seatIndex] = false
 
+	if table.DealerSeatIndex == seatIndex {
+		newDealer := -1
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && i != seatIndex {
+				newDealer = i
+				break
+			}
+		}
+		table.DealerSeatIndex = newDealer
+	}
+
+	occupiedSeats := 0
+	for _, seat := range table.Seats {
+		if seat.UserID != 0 {
+			occupiedSeats++
+		}
+	}
+
+	if occupiedSeats < 2 {
+		table.GameStarted = false
+		table.Deck = []string{}
+		for i := range table.SeatCards {
+			table.SeatCards[i].Hand = []string{}
+			table.SeatCards[i].Played = []string{}
+		}
+	}
+
 	usernames, _ := fetchUsernames(table.Players)
 	table.PlayerUsernames = usernames
 
@@ -578,4 +686,20 @@ func fetchUsernames(userIDs []uint) ([]string, error) {
 		usernames[i] = user.Username
 	}
 	return usernames, nil
+}
+
+func createDeck() []string {
+	suits := []string{"c", "d", "h", "s"}
+	values := []string{"3", "4", "5", "6", "7", "8", "9", "10"}
+	deck := []string{}
+	for _, suit := range suits {
+		for _, value := range values {
+			deck = append(deck, suit+value)
+		}
+	}
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(deck), func(i, j int) {
+		deck[i], deck[j] = deck[j], deck[i]
+	})
+	return deck
 }

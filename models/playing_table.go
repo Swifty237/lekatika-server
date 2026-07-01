@@ -37,7 +37,7 @@ type PlayingTable struct {
 	Seats             []Seat        `json:"seats"`
 	SeatsConnected    []bool        `json:"seatsConnected"` // true = connecté, false = déconnecté
 	SeatCards         []SeatCards   `json:"seatCards"`      // 4 éléments (un par siège)
-	Dealer            string        `json:"dealer"`
+	DealerSeatIndex   int           `json:"dealer_seat_index"`
 	Turn              string        `json:"turn"`
 	LastWinningSeat   string        `json:"last_winning_seat"` // Pour garder une trace du dernier gagnant
 	LastRoundWinner   string        `json:"last_round_winner"`
@@ -59,4 +59,6 @@ type PlayingTable struct {
 	ChatMessages      []ChatMessage `json:"chat_messages"`
 	InviteLink        string        `json:"invite_link"`
 	DisconnectedAt    []int64       `json:"disconnected_at"` // 0 = connecté
+	Deck              []string      `json:"deck"`
+	GameStarted       bool          `json:"game_started"`
 }

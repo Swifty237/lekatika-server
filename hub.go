@@ -106,12 +106,6 @@ func (c *Client) readPump(hub *Hub) {
 			continue
 		}
 		switch msgType {
-		case "SIT":
-			tableID, _ := msg["tableId"].(string)
-			seatIdxFloat, _ := msg["seatIndex"].(float64)
-			if tableID != "" {
-				controllers.HandleSit(tableID, int(seatIdxFloat), c.userID)
-			}
 		case "PLAY_CARD":
 			tableID, _ := msg["tableId"].(string)
 			seatIdxFloat, _ := msg["seatIndex"].(float64)
