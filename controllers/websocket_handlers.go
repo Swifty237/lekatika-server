@@ -2,12 +2,11 @@ package controllers
 
 import (
 	"encoding/json"
+	"fmt"
 	"lekatika-server/database"
 	"lekatika-server/models"
-	"time"
 )
 
-// HandlePlayCard déplace une carte de la main vers les cartes jouées
 func HandlePlayCard(tableID string, seatIndex int, cardIndex int, userID uint) {
 	key := "table:" + tableID
 	val, err := database.RedisClient.Get(database.Ctx, key).Result()
@@ -26,13 +25,15 @@ func HandlePlayCard(tableID string, seatIndex int, cardIndex int, userID uint) {
 	if cardIndex < 0 || cardIndex >= len(table.SeatCards[seatIndex].Hand) {
 		return
 	}
-	// Déplacer la carte
+	// Récupérer la carte
 	card := table.SeatCards[seatIndex].Hand[cardIndex]
-	table.SeatCards[seatIndex].Hand = append(table.SeatCards[seatIndex].Hand[:cardIndex], table.SeatCards[seatIndex].Hand[cardIndex+1:]...)
-	table.SeatCards[seatIndex].Played = append(table.SeatCards[seatIndex].Played, card)
-	// Sauvegarder
-	updatedJSON, _ := json.Marshal(table)
-	database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour)
-	// Notifier tous les clients
-	database.PublishTableUpdate(tableID)
+	// Appeler la logique de jeu
+	if err := ProcessPlayCard(&table, seatIndex, card); err != nil {
+		// En cas d'erreur, on peut envoyer un message d'erreur via WebSocket
+		// Pour l'instant, on log
+		fmt.Printf("Erreur lors du jeu de la carte: %v\n", err)
+		return
+	}
+	// La table a été mise à jour par ProcessPlayCard, qui appelle saveAndNotify
+	// On n'a pas besoin de sauvegarder ici
 }

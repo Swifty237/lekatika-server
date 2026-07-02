@@ -70,30 +70,39 @@ func CreateTable(c *gin.Context) {
 			{Hand: []string{}, Played: []string{}},
 			{Hand: []string{}, Played: []string{}},
 		},
-		DealerSeatIndex:   -1,
-		Turn:              "",
-		LastWinningSeat:   "",
-		LastRoundWinner:   "",
-		Pot:               "0",
-		HandOver:          false,
-		HandCompleted:     false,
-		WinMessages:       []string{},
-		GameNotifications: []string{},
-		History:           []string{},
-		SeatTurnTimer:     []string{},
-		DemandedSuit:      []string{},
-		CurrentRoundCards: []string{},
-		RoundNumber:       0,
-		CountHand:         0,
-		HandParticipants:  []string{},
-		WonByCombination:  false,
-		OnTurnChanged:     []string{},
-		ChatRoom:          []string{},
-		ChatMessages:      []models.ChatMessage{},
-		InviteLink:        inviteLink,
-		DisconnectedAt:    []int64{0, 0, 0, 0},
-		Deck:              []string{},
-		GameStarted:       false,
+		DealerSeatIndex:      -1,
+		Turn:                 "",
+		LastWinningSeat:      "",
+		LastRoundWinner:      "",
+		Pot:                  0,
+		HandOver:             false,
+		HandCompleted:        false,
+		WinMessages:          []string{},
+		GameNotifications:    []string{},
+		History:              []string{},
+		SeatTurnTimer:        []string{},
+		DemandedSuit:         []string{},
+		CurrentRoundCards:    []string{},
+		RoundNumber:          0,
+		CountHand:            0,
+		HandParticipants:     []string{},
+		WonByCombination:     false,
+		OnTurnChanged:        []string{},
+		ChatRoom:             []string{},
+		ChatMessages:         []models.ChatMessage{},
+		InviteLink:           inviteLink,
+		DisconnectedAt:       []int64{0, 0, 0, 0},
+		Deck:                 []string{},
+		GameStarted:          false,
+		Starting:             false,
+		Dealing:              false,
+		CurrentRound:         0,
+		CurrentTurnSeatIndex: -1,
+		SuitRequired:         "",
+		RoundPlayedCards:     []models.RoundCard{},
+		RoundWinnerSeatIndex: -1,
+		LastRoundWinnerSeat:  -1,
+		HandWinnerSeat:       -1,
 	}
 
 	// Stocker dans Redis (clé: table:{ID})
@@ -300,9 +309,9 @@ func LeaveTable(c *gin.Context) {
 			occupiedSeats++
 		}
 	}
-
 	if occupiedSeats < 2 {
 		table.GameStarted = false
+		table.Starting = false
 		table.Deck = []string{}
 		for i := range table.SeatCards {
 			table.SeatCards[i].Hand = []string{}
@@ -500,45 +509,21 @@ func SitAtTable(c *gin.Context) {
 		}
 	}
 
-	if occupiedSeats >= 2 {
-		// Si le jeu n'est pas encore commencé, initialiser le deck et distribuer à tous
-		if !table.GameStarted {
-			if len(table.Deck) == 0 {
-				table.Deck = createDeck()
-			}
-			// Distribuer 5 cartes à chaque siège occupé qui n'en a pas
-			for i, seat := range table.Seats {
-				if seat.UserID != 0 && len(table.SeatCards[i].Hand) == 0 {
-					hand := []string{}
-					for j := 0; j < 5 && len(table.Deck) > 0; j++ {
-						hand = append(hand, table.Deck[0])
-						table.Deck = table.Deck[1:]
-					}
-					table.SeatCards[i].Hand = hand
-					table.SeatCards[i].Played = []string{}
-				}
-			}
-			table.GameStarted = true
-		} else {
-			// La partie est déjà commencée : distribuer uniquement au nouveau joueur
-			if len(table.SeatCards[seatIndex].Hand) == 0 {
-				// Vérifier s'il reste assez de cartes dans le deck
-				if len(table.Deck) >= 5 {
-					hand := []string{}
-					for j := 0; j < 5; j++ {
-						hand = append(hand, table.Deck[0])
-						table.Deck = table.Deck[1:]
-					}
-					table.SeatCards[seatIndex].Hand = hand
-					table.SeatCards[seatIndex].Played = []string{}
-				} else {
-					// Optionnel : si le deck est vide, on pourrait recréer un deck, mais cela dupliquerait les cartes
-					// Pour l'instant, on ne fait rien ou on distribue ce qui reste
-					// On peut aussi envoyer une erreur indiquant qu'il n'y a plus de cartes
-					// Mais pour l'instant, on ignore
-				}
-			}
-		}
+	// Dans SitAtTable, après avoir assis l'utilisateur et compté occupiedSeats
+
+	if occupiedSeats >= 2 && !table.GameStarted && !table.Starting {
+		table.Starting = true
+		updatedJSON, _ := json.Marshal(table)
+		database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour)
+
+		// Lancer la distribution des cartes dans une goroutine
+		go func() {
+			time.Sleep(3 * time.Second) // Attendre 3 secondes pour le toast
+			distributeCardsForHand(tableID)
+		}()
+
+		// Envoyer le message GAME_STARTING pour le toast
+		database.PublishGameStarting(tableID)
 	}
 
 	// Sauvegarder la table mise à jour
@@ -639,9 +624,9 @@ func UnseatFromTable(c *gin.Context) {
 			occupiedSeats++
 		}
 	}
-
 	if occupiedSeats < 2 {
 		table.GameStarted = false
+		table.Starting = false
 		table.Deck = []string{}
 		for i := range table.SeatCards {
 			table.SeatCards[i].Hand = []string{}

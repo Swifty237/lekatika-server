@@ -66,3 +66,24 @@ func PublishTableUpdate(tableID string) {
 	eventJSON, _ := json.Marshal(event)
 	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
+
+func PublishGameStarting(tableID string) {
+	event := map[string]string{
+		"type":    "GAME_STARTING",
+		"tableId": tableID,
+		"message": "Début de partie !",
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
+}
+
+// PublishToast envoie un message GAME_EVENT à tous les clients de la table
+func PublishGameEvent(tableID string, message string) {
+	event := map[string]string{
+		"type":    "GAME_EVENT",
+		"tableId": tableID,
+		"message": message,
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
+}
