@@ -87,3 +87,28 @@ func PublishGameEvent(tableID string, message string) {
 	eventJSON, _ := json.Marshal(event)
 	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
+
+// PublishSeatBetUpdate notifie le front pour mettre à jour le montant du siège et le seatBet
+func PublishSeatBetUpdate(tableID string, seatIndex int, newAmountAtStake int, seatBet int) {
+	event := map[string]interface{}{
+		"type":             "SEAT_BET_UPDATE",
+		"tableId":          tableID,
+		"seatIndex":        seatIndex,
+		"newAmountAtStake": newAmountAtStake,
+		"seatBet":          seatBet,
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
+}
+
+// PublishPotUpdate notifie le front pour mettre à jour le pot et réinitialiser seatBet
+func PublishPotUpdate(tableID string, pot int) {
+	event := map[string]interface{}{
+		"type":    "POT_UPDATE",
+		"tableId": tableID,
+		"pot":     pot,
+		"seatBet": 0,
+	}
+	eventJSON, _ := json.Marshal(event)
+	RedisClient.Publish(Ctx, "tables", eventJSON)
+}

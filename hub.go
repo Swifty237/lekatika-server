@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"sync"
 
 	"lekatika-server/controllers"
@@ -120,6 +121,39 @@ func (c *Client) readPump(hub *Hub) {
 			if tableID != "" && content != "" {
 				controllers.HandleChatMessage(tableID, c.userID, content)
 			}
+
+		case "CHECK_THREE_SEVEN":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			log.Printf("CHECK_THREE_SEVEN reçu: table=%s, seat=%v, user=%d", tableID, int(seatIdxFloat), c.userID)
+			if tableID != "" {
+				HandleThreeSeven(hub, tableID, int(seatIdxFloat), c.userID)
+			}
 		}
+	}
+}
+
+// SendPrivateMessage envoie un message à un utilisateur spécifique par son ID
+func (h *Hub) SendPrivateMessage(userID uint, payload interface{}) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	found := false
+	for client := range h.clients {
+		if client.userID == userID {
+			select {
+			case client.send <- data:
+				found = true
+			default:
+				log.Printf("Client %d saturé, message non envoyé", userID)
+			}
+			break
+		}
+	}
+	if !found {
+		log.Printf("⚠️ Message privé pour l'utilisateur %d non délivré : client non trouvé dans le hub", userID)
 	}
 }

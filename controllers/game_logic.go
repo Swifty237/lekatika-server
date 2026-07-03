@@ -7,8 +7,6 @@ import (
 	"lekatika-server/models"
 	"log"
 	"time"
-
-	"gorm.io/gorm"
 )
 
 // Fonctions auxiliaires pour les cartes
@@ -85,32 +83,81 @@ func StartHand(table *models.PlayingTable) error {
 		if occupied < 2 {
 			return fmt.Errorf("not enough players")
 		}
-		// Initialiser la manche
+
+		// Initialiser les variables de la manche
 		table.CurrentRound = 1
 		table.SuitRequired = ""
 		table.RoundPlayedCards = []models.RoundCard{}
 		table.RoundWinnerSeatIndex = -1
 		table.LastRoundWinnerSeat = -1
 		table.HandWinnerSeat = -1
-		// Calcul du pot
-		totalPot := 0
-		for _, seat := range table.Seats {
-			if seat.UserID != 0 {
-				totalPot += seat.AmountAtStake
-			}
-		}
-		table.Pot = totalPot
-		// Déterminer le premier joueur
+
+		// Déterminer le premier joueur (pour plus tard)
 		firstPlayer := getFirstPlayer(table)
 		if firstPlayer == -1 {
 			return fmt.Errorf("no first player found")
 		}
 		table.CurrentTurnSeatIndex = firstPlayer
+
+		// Lancer la séquence de prélèvement des mises dans une goroutine
+		go func(tableID string, tableModel models.PlayingTable) {
+			// 1. Prélèvement des mises et mise à jour des sièges
+			totalPot := 0
+			for i, seat := range tableModel.Seats {
+				if seat.UserID == 0 {
+					continue
+				}
+
+				// userID := uint(seat.UserID)
+				// Récupérer l'utilisateur depuis Redis pour vérifier le solde (optionnel)
+				// ...
+
+				// Déduire le montant du siège (AmountAtStake)
+				newAmountAtStake := seat.AmountAtStake - tableModel.Bet
+				if newAmountAtStake < 0 {
+					newAmountAtStake = 0
+				}
+				tableModel.Seats[i].AmountAtStake = newAmountAtStake
+
+				// Envoyer un événement SEAT_BET_UPDATE à tous les clients
+				database.PublishSeatBetUpdate(tableID, i, newAmountAtStake, tableModel.Bet)
+
+				totalPot += tableModel.Bet
+			}
+
+			//  Sauvegarder immédiatement la table avec les AmountAtStake modifiés
+			tableJSON, _ := json.Marshal(tableModel)
+			database.RedisClient.Set(database.Ctx, "table:"+tableID, tableJSON, 24*time.Hour)
+
+			// 2. Attendre 3 secondes
+			time.Sleep(3 * time.Second)
+
+			// 3. Mettre à jour le pot et envoyer l'événement POT_UPDATE
+			// Récupérer la table à jour (qui contient déjà les bons AmountAtStake)
+			val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+			if err != nil {
+				log.Printf("Erreur récupération table après délai: %v", err)
+				return
+			}
+			var updatedTable models.PlayingTable
+			if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
+				log.Printf("Erreur désérialisation table après délai: %v", err)
+				return
+			}
+			updatedTable.Pot = totalPot
+			// Sauvegarder la table avec le pot
+			SaveAndNotify(&updatedTable)
+
+			// Envoyer l'événement POT_UPDATE
+			database.PublishPotUpdate(tableID, totalPot)
+
+			// (Les cartes sont déjà distribuées, le jeu continue)
+		}(table.ID, *table)
+
 		return nil
-	} else {
-		log.Printf("StartHand failed: GameStarted=%v, CurrentRound=%d", table.GameStarted, table.CurrentRound)
-		return fmt.Errorf("game not started or already in hand")
 	}
+	log.Printf("StartHand failed: GameStarted=%v, CurrentRound=%d", table.GameStarted, table.CurrentRound)
+	return fmt.Errorf("game not started or already in hand")
 }
 
 func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) error {
@@ -169,7 +216,7 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 		// Tous les joueurs ayant des cartes ont joué dans ce tour
 		processRoundEnd(table)
 	} else {
-		saveAndNotify(table)
+		SaveAndNotify(table)
 	}
 
 	return nil
@@ -210,28 +257,28 @@ func processRoundEnd(table *models.PlayingTable) {
 	if table.CurrentRound == 5 {
 		table.HandWinnerSeat = bestSeat
 		table.DealerSeatIndex = bestSeat
-		awardPotToWinner(table, bestSeat)
+		AwardPotToWinner(table, bestSeat)
 
 		// Sauvegarder la table avec les mains intactes (les joueurs voient encore leurs cartes)
-		saveAndNotify(table)
+		SaveAndNotify(table)
 
 		// Lancer la séquence d'événements et de redistribution
 		go func(tableID string, winnerSeat int) {
 			// 1. "Fin de manche" → immédiat
 			database.PublishGameEvent(tableID, "Fin de manche")
 
-			time.Sleep(4 * time.Second)
+			time.Sleep(3 * time.Second)
 
 			// 2. "X gagne la manche" → après 4s
-			username := getUsernameFromSeat(tableID, winnerSeat)
+			username := GetUsernameFromSeat(tableID, winnerSeat)
 			database.PublishGameEvent(tableID, username+" gagne la manche")
 
-			time.Sleep(4 * time.Second)
+			time.Sleep(3 * time.Second)
 
 			// 3. "Début de la nouvelle manche dans quelques secondes" → après 8s
 			database.PublishGameEvent(tableID, "Début de la nouvelle manche")
 
-			time.Sleep(4 * time.Second)
+			time.Sleep(3 * time.Second)
 
 			// 4. Récupérer la table à jour, vider les mains et réinitialiser → après 6s
 			val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
@@ -258,10 +305,10 @@ func processRoundEnd(table *models.PlayingTable) {
 			}
 
 			// Sauvegarder la table vidée
-			saveAndNotify(&updatedTable)
+			SaveAndNotify(&updatedTable)
 
 			// Lancer la distribution pour la nouvelle manche
-			distributeCardsForHand(tableID)
+			DistributeCardsForHand(tableID)
 		}(table.ID, bestSeat)
 
 	} else {
@@ -273,38 +320,25 @@ func processRoundEnd(table *models.PlayingTable) {
 		}
 		table.SuitRequired = ""
 		table.RoundPlayedCards = []models.RoundCard{}
-		saveAndNotify(table)
+		SaveAndNotify(table)
 	}
 }
 
 // awardPotToWinner ajoute le pot à la bankroll du gagnant
-func awardPotToWinner(table *models.PlayingTable, seatIndex int) {
+func AwardPotToWinner(table *models.PlayingTable, seatIndex int) {
 	if table.Pot <= 0 {
 		return
 	}
-	userID := uint(table.Seats[seatIndex].UserID)
-	// Mettre à jour la bankroll dans Redis
-	userKey := fmt.Sprintf("user:%d", userID)
-	val, err := database.RedisClient.Get(database.Ctx, userKey).Result()
-	if err == nil {
-		var userRedis models.UserRedis
-		if err := json.Unmarshal([]byte(val), &userRedis); err == nil {
-			if userRedis.FreeChipsAmountBankroll != nil {
-				newBalance := *userRedis.FreeChipsAmountBankroll + float64(table.Pot)
-				userRedis.FreeChipsAmountBankroll = &newBalance
-				updatedUserJSON, _ := json.Marshal(userRedis)
-				database.RedisClient.Set(database.Ctx, userKey, updatedUserJSON, 72*time.Hour)
-			}
-		}
+	// Ajouter le pot au AmountAtStake du siège gagnant
+	if seatIndex >= 0 && seatIndex < len(table.Seats) {
+		table.Seats[seatIndex].AmountAtStake += table.Pot
 	}
-	// Mettre à jour PostgreSQL
-	database.DB.Model(&models.User{}).Where("id = ?", userID).
-		Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll + ?", table.Pot))
+	// Remettre le pot à 0
 	table.Pot = 0
 }
 
 // saveAndNotify sauvegarde la table et notifie les clients
-func saveAndNotify(table *models.PlayingTable) {
+func SaveAndNotify(table *models.PlayingTable) {
 	key := "table:" + table.ID
 	updatedJSON, _ := json.Marshal(table)
 	database.RedisClient.Set(database.Ctx, key, updatedJSON, 24*time.Hour)
@@ -334,11 +368,12 @@ func startNewHand(tableID string) {
 	}
 	// On peut lancer la distribution progressive (comme dans SitAtTable)
 	// en utilisant une goroutine
-	go distributeCardsForHand(tableID) // à définir
+	go DistributeCardsForHand(tableID) // à définir
 }
 
 // distributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
-func distributeCardsForHand(tableID string) {
+// distributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
+func DistributeCardsForHand(tableID string) {
 	// Récupérer la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
@@ -369,7 +404,7 @@ func distributeCardsForHand(tableID string) {
 		return
 	}
 
-	// Déterminer l'ordre de distribution (non-dealer puis dealer)
+	// Déterminer le dealer
 	dealerIdx := table.DealerSeatIndex
 	if dealerIdx == -1 {
 		for i, seat := range table.Seats {
@@ -381,15 +416,46 @@ func distributeCardsForHand(tableID string) {
 		}
 	}
 
-	seatsIndices := []int{}
+	// --- CORRECTION : Construire l'ordre circulaire à partir du dealer ---
+	// Récupérer tous les sièges occupés
+	occupiedSeats := []int{}
 	for i, seat := range table.Seats {
-		if seat.UserID != 0 && i != dealerIdx {
-			seatsIndices = append(seatsIndices, i)
+		if seat.UserID != 0 {
+			occupiedSeats = append(occupiedSeats, i)
 		}
 	}
-	if dealerIdx >= 0 && table.Seats[dealerIdx].UserID != 0 {
-		seatsIndices = append(seatsIndices, dealerIdx)
+
+	// Trier les sièges dans l'ordre circulaire en partant de dealer+1
+	seatsIndices := []int{}
+	n := len(table.Seats)
+	// On commence par le siège après le dealer
+	start := (dealerIdx + 1) % n
+	for i := 0; i < len(occupiedSeats); i++ {
+		idx := (start + i) % n
+		// Vérifier si ce siège est occupé
+		for _, occ := range occupiedSeats {
+			if occ == idx {
+				seatsIndices = append(seatsIndices, idx)
+				break
+			}
+		}
 	}
+	// Si le dealer n'est pas le dernier, on l'ajoute s'il est occupé (il doit l'être)
+	if dealerIdx >= 0 && table.Seats[dealerIdx].UserID != 0 {
+		// Il est déjà dans la liste? On le met à la fin
+		// On le retire s'il a été ajouté (normalement non, car on a commencé après lui)
+		// Pour être sûr, on le retire et on l'ajoute à la fin
+		newSeats := []int{}
+		for _, s := range seatsIndices {
+			if s != dealerIdx {
+				newSeats = append(newSeats, s)
+			}
+		}
+		seatsIndices = append(newSeats, dealerIdx)
+	}
+
+	log.Printf("DistributeCards: dealerIdx=%d, seatsIndices=%v", dealerIdx, seatsIndices)
+	// --- Fin correction ---
 
 	// Créer un nouveau deck
 	table.Deck = createDeck()
@@ -414,7 +480,6 @@ func distributeCardsForHand(tableID string) {
 			cardsCount = 2
 		}
 		for _, seatIdx := range seatsIndices {
-			// NE PAS SAUTER les joueurs qui ont déjà des cartes
 			cards, err := dealCards(cardsCount)
 			if err != nil {
 				log.Printf("Erreur distribution pour siège %d: %v", seatIdx, err)
@@ -422,7 +487,6 @@ func distributeCardsForHand(tableID string) {
 			}
 			table.SeatCards[seatIdx].Hand = append(table.SeatCards[seatIdx].Hand, cards...)
 
-			// Sauvegarder et notifier
 			updatedJSON, _ := json.Marshal(table)
 			database.RedisClient.Set(database.Ctx, "table:"+tableID, updatedJSON, 24*time.Hour)
 			dealEvent := map[string]interface{}{
@@ -447,7 +511,7 @@ func distributeCardsForHand(tableID string) {
 	database.PublishTableUpdate(tableID)
 }
 
-func getUsernameFromSeat(tableID string, seatIndex int) string {
+func GetUsernameFromSeat(tableID string, seatIndex int) string {
 	key := "table:" + tableID
 	val, err := database.RedisClient.Get(database.Ctx, key).Result()
 	if err != nil {
@@ -472,3 +536,15 @@ func getUsernameFromSeat(tableID string, seatIndex int) string {
 	}
 	return user.Username
 }
+
+// sendGameError envoie un message d'erreur via WebSocket
+// func sendGameError(tableID string, message string) {
+// 	event := map[string]string{
+// 		"type":    "GAME_EVENT",
+// 		"tableId": tableID,
+// 		"message": message,
+// 		"isError": "true",
+// 	}
+// 	eventJSON, _ := json.Marshal(event)
+// 	database.RedisClient.Publish(database.Ctx, "tables", eventJSON)
+// }

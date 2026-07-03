@@ -519,7 +519,7 @@ func SitAtTable(c *gin.Context) {
 		// Lancer la distribution des cartes dans une goroutine
 		go func() {
 			time.Sleep(3 * time.Second) // Attendre 3 secondes pour le toast
-			distributeCardsForHand(tableID)
+			DistributeCardsForHand(tableID)
 		}()
 
 		// Envoyer le message GAME_STARTING pour le toast
