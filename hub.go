@@ -122,12 +122,68 @@ func (c *Client) readPump(hub *Hub) {
 				controllers.HandleChatMessage(tableID, c.userID, content)
 			}
 
+		case "CHECK_SQUARE":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			seatIndex := int(seatIdxFloat)
+			value := 0
+			if v, ok := msg["value"].(float64); ok {
+				value = int(v)
+			}
+			log.Printf("CHECK_SQUARE reçu: table=%s, seat=%d, user=%d, value=%d", tableID, seatIndex, c.userID, value)
+			if tableID != "" {
+				err := controllers.AddAnnouncement(tableID, seatIndex, c.userID, "square", value)
+				if err != nil {
+					log.Printf("Erreur lors de l'ajout de l'annonce: %v", err)
+					// Envoyer un message d'erreur privé au client
+					errorPayload := map[string]interface{}{
+						"type":    "ERROR",
+						"message": err.Error(),
+					}
+					hub.SendPrivateMessage(c.userID, errorPayload)
+				}
+			}
+
 		case "CHECK_THREE_SEVEN":
 			tableID, _ := msg["tableId"].(string)
 			seatIdxFloat, _ := msg["seatIndex"].(float64)
-			log.Printf("CHECK_THREE_SEVEN reçu: table=%s, seat=%v, user=%d", tableID, int(seatIdxFloat), c.userID)
+			seatIndex := int(seatIdxFloat)
+			value := 0
+			if v, ok := msg["value"].(float64); ok {
+				value = int(v)
+			}
+			log.Printf("CHECK_THREE_SEVEN reçu: table=%s, seat=%d, user=%d, value=%d", tableID, seatIndex, c.userID, value)
 			if tableID != "" {
-				HandleThreeSeven(hub, tableID, int(seatIdxFloat), c.userID)
+				err := controllers.AddAnnouncement(tableID, seatIndex, c.userID, "three_seven", value)
+				if err != nil {
+					log.Printf("Erreur lors de l'ajout de l'annonce: %v", err)
+					errorPayload := map[string]interface{}{
+						"type":    "ERROR",
+						"message": err.Error(),
+					}
+					hub.SendPrivateMessage(c.userID, errorPayload)
+				}
+			}
+
+		case "CHECK_TIA":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			seatIndex := int(seatIdxFloat)
+			value := 0
+			if v, ok := msg["value"].(float64); ok {
+				value = int(v)
+			}
+			log.Printf("CHECK_TIA reçu: table=%s, seat=%d, user=%d, value=%d", tableID, seatIndex, c.userID, value)
+			if tableID != "" {
+				err := controllers.AddAnnouncement(tableID, seatIndex, c.userID, "tia", value)
+				if err != nil {
+					log.Printf("Erreur lors de l'ajout de l'annonce: %v", err)
+					errorPayload := map[string]interface{}{
+						"type":    "ERROR",
+						"message": err.Error(),
+					}
+					hub.SendPrivateMessage(c.userID, errorPayload)
+				}
 			}
 		}
 	}
@@ -154,6 +210,6 @@ func (h *Hub) SendPrivateMessage(userID uint, payload interface{}) {
 		}
 	}
 	if !found {
-		log.Printf("⚠️ Message privé pour l'utilisateur %d non délivré : client non trouvé dans le hub", userID)
+		log.Printf("Message privé pour l'utilisateur %d non délivré : client non trouvé dans le hub", userID)
 	}
 }

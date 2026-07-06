@@ -46,6 +46,7 @@ type PlayingTable struct {
 	Turn                 string        `json:"turn"`
 	LastWinningSeat      string        `json:"last_winning_seat"` // Pour garder une trace du dernier gagnant
 	LastRoundWinner      string        `json:"last_round_winner"`
+	ThreeSevenSeat       int           `json:"three_seven_seat"`
 	Pot                  int           `json:"pot"`
 	HandOver             bool          `json:"hand_over"`
 	HandCompleted        bool          `json:"hand_completed"` // Pour éviter les doubles démarrages de main
@@ -75,4 +76,5 @@ type PlayingTable struct {
 	RoundWinnerSeatIndex int           `json:"round_winner_seat_index"`
 	LastRoundWinnerSeat  int           `json:"last_round_winner_seat"`
 	HandWinnerSeat       int           `json:"hand_winner_seat"`
+	RevealedSeats        []bool        `json:"revealedSeats"`
 }

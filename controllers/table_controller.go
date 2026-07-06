@@ -74,6 +74,7 @@ func CreateTable(c *gin.Context) {
 		Turn:                 "",
 		LastWinningSeat:      "",
 		LastRoundWinner:      "",
+		ThreeSevenSeat:       -1,
 		Pot:                  0,
 		HandOver:             false,
 		HandCompleted:        false,
@@ -103,6 +104,7 @@ func CreateTable(c *gin.Context) {
 		RoundWinnerSeatIndex: -1,
 		LastRoundWinnerSeat:  -1,
 		HandWinnerSeat:       -1,
+		RevealedSeats:        []bool{false, false, false, false},
 	}
 
 	// Stocker dans Redis (clé: table:{ID})

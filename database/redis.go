@@ -112,3 +112,39 @@ func PublishPotUpdate(tableID string, pot int) {
 	eventJSON, _ := json.Marshal(event)
 	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
+
+// AddAnnouncement ajoute une annonce pour une table
+func AddAnnouncement(tableID string, announcement map[string]interface{}) error {
+	key := "table:" + tableID + ":announcements"
+	data, _ := json.Marshal(announcement)
+	return RedisClient.RPush(Ctx, key, data).Err()
+}
+
+// GetAnnouncements récupère toutes les annonces pour une table
+func GetAnnouncements(tableID string) ([]map[string]interface{}, error) {
+	key := "table:" + tableID + ":announcements"
+	vals, err := RedisClient.LRange(Ctx, key, 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	announcements := []map[string]interface{}{}
+	for _, val := range vals {
+		var ann map[string]interface{}
+		if err := json.Unmarshal([]byte(val), &ann); err == nil {
+			announcements = append(announcements, ann)
+		}
+	}
+	return announcements, nil
+}
+
+// ClearAnnouncements supprime toutes les annonces pour une table
+func ClearAnnouncements(tableID string) error {
+	key := "table:" + tableID + ":announcements"
+	return RedisClient.Del(Ctx, key).Err()
+}
+
+// RemoveFirstAnnouncement retire la première annonce (la plus ancienne)
+func RemoveFirstAnnouncement(tableID string) error {
+	key := "table:" + tableID + ":announcements"
+	return RedisClient.LPop(Ctx, key).Err()
+}

@@ -10,7 +10,7 @@ import (
 )
 
 // Fonctions auxiliaires pour les cartes
-func cardValue(card string) int {
+func CardValue(card string) int {
 	// Ex: "c3" -> 3, "s10" -> 10
 	valStr := card[1:]
 	if valStr == "10" {
@@ -229,7 +229,7 @@ func processRoundEnd(table *models.PlayingTable) {
 	bestSeat := -1
 	for _, played := range table.RoundPlayedCards {
 		if cardSuit(played.Card) == table.SuitRequired {
-			if bestSeat == -1 || cardValue(played.Card) > cardValue(bestCard) {
+			if bestSeat == -1 || CardValue(played.Card) > CardValue(bestCard) {
 				bestCard = played.Card
 				bestSeat = played.SeatIndex
 			}
@@ -259,28 +259,39 @@ func processRoundEnd(table *models.PlayingTable) {
 		table.DealerSeatIndex = bestSeat
 		AwardPotToWinner(table, bestSeat)
 
-		// Sauvegarder la table avec les mains intactes (les joueurs voient encore leurs cartes)
+		// Capturer l'ID du gagnant avant la goroutine
+		winnerUserID := uint(0)
+		if bestSeat >= 0 && bestSeat < len(table.Seats) {
+			winnerUserID = uint(table.Seats[bestSeat].UserID)
+		}
+		log.Printf("[ROUND_END] winnerSeat=%d, winnerUserID=%d", bestSeat, winnerUserID)
+
 		SaveAndNotify(table)
 
-		// Lancer la séquence d'événements et de redistribution
-		go func(tableID string, winnerSeat int) {
+		go func(tableID string, winnerSeat int, winnerUserID uint) {
 			// 1. "Fin de manche" → immédiat
 			database.PublishGameEvent(tableID, "Fin de manche")
+			log.Printf("[ROUND_END] Fin de manche pour table %s", tableID)
 
 			time.Sleep(3 * time.Second)
 
-			// 2. "X gagne la manche" → après 4s
-			username := GetUsernameFromSeat(tableID, winnerSeat)
+			// 2. "X gagne la manche" → après 3s
+			// Utiliser GetUsernameByUserID au lieu de GetUsernameFromSeat
+			username := GetUsernameByUserID(winnerUserID)
+			if username == "" {
+				username = fmt.Sprintf("Joueur %d", winnerUserID)
+			}
+			log.Printf("[ROUND_END] Gagnant: seat=%d, userID=%d, username=%s", winnerSeat, winnerUserID, username)
 			database.PublishGameEvent(tableID, username+" gagne la manche")
 
 			time.Sleep(3 * time.Second)
 
-			// 3. "Début de la nouvelle manche dans quelques secondes" → après 8s
+			// 3. "Début de la nouvelle manche dans quelques secondes" → après 6s
 			database.PublishGameEvent(tableID, "Début de la nouvelle manche")
 
 			time.Sleep(3 * time.Second)
 
-			// 4. Récupérer la table à jour, vider les mains et réinitialiser → après 6s
+			// 4. Récupérer la table à jour, vider les mains et réinitialiser → après 9s
 			val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 			if err != nil {
 				log.Printf("Erreur récupération table pour vidage: %v", err)
@@ -304,13 +315,11 @@ func processRoundEnd(table *models.PlayingTable) {
 				updatedTable.SeatCards[i].Played = []string{}
 			}
 
-			// Sauvegarder la table vidée
 			SaveAndNotify(&updatedTable)
 
-			// Lancer la distribution pour la nouvelle manche
+			// Lancer la nouvelle distribution
 			DistributeCardsForHand(tableID)
-		}(table.ID, bestSeat)
-
+		}(table.ID, bestSeat, winnerUserID)
 	} else {
 		// Tour suivant
 		table.CurrentRound++
@@ -371,8 +380,7 @@ func startNewHand(tableID string) {
 	go DistributeCardsForHand(tableID) // à définir
 }
 
-// distributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
-// distributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
+// DistributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
 func DistributeCardsForHand(tableID string) {
 	// Récupérer la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
@@ -386,11 +394,24 @@ func DistributeCardsForHand(tableID string) {
 		return
 	}
 
+	table.RevealedSeats = make([]bool, len(table.Seats))
+
 	// Vider les mains de tous les joueurs au début
 	for i := range table.SeatCards {
 		table.SeatCards[i].Hand = []string{}
 		table.SeatCards[i].Played = []string{}
 	}
+
+	database.ClearAnnouncements(tableID)
+
+	// Réinitialiser ThreeSevenSeat
+	table.ThreeSevenSeat = -1
+
+	// Sauvegarder et notifier la table avec les mains vidées
+	SaveAndNotify(&table)
+
+	// Attendre 300ms pour que les clients reçoivent la mise à jour
+	time.Sleep(300 * time.Millisecond)
 
 	// Vérifier qu'il y a au moins 2 joueurs assis
 	occupied := 0
@@ -399,6 +420,7 @@ func DistributeCardsForHand(tableID string) {
 			occupied++
 		}
 	}
+
 	if occupied < 2 {
 		log.Printf("distributeCardsForHand: pas assez de joueurs (%d)", occupied)
 		return
@@ -537,14 +559,15 @@ func GetUsernameFromSeat(tableID string, seatIndex int) string {
 	return user.Username
 }
 
-// sendGameError envoie un message d'erreur via WebSocket
-// func sendGameError(tableID string, message string) {
-// 	event := map[string]string{
-// 		"type":    "GAME_EVENT",
-// 		"tableId": tableID,
-// 		"message": message,
-// 		"isError": "true",
-// 	}
-// 	eventJSON, _ := json.Marshal(event)
-// 	database.RedisClient.Publish(database.Ctx, "tables", eventJSON)
-// }
+func GetUsernameByUserID(userID uint) string {
+	userKey := fmt.Sprintf("user:%d", userID)
+	userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+	if err != nil {
+		return fmt.Sprintf("Joueur %d", userID)
+	}
+	var user models.UserRedis
+	if err := json.Unmarshal([]byte(userVal), &user); err != nil {
+		return fmt.Sprintf("Joueur %d", userID)
+	}
+	return user.Username
+}
