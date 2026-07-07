@@ -77,4 +77,5 @@ type PlayingTable struct {
 	LastRoundWinnerSeat  int           `json:"last_round_winner_seat"`
 	HandWinnerSeat       int           `json:"hand_winner_seat"`
 	RevealedSeats        []bool        `json:"revealedSeats"`
+	ParticipatingSeats   []bool        `json:"participatingSeats"` // true pour les sièges participants à la manche
 }

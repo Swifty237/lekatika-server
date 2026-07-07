@@ -92,6 +92,14 @@ func StartHand(table *models.PlayingTable) error {
 		table.LastRoundWinnerSeat = -1
 		table.HandWinnerSeat = -1
 
+		// Initialiser la liste des participants (sièges occupés)
+		table.ParticipatingSeats = make([]bool, len(table.Seats))
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 {
+				table.ParticipatingSeats[i] = true
+			}
+		}
+
 		// Déterminer le premier joueur (pour plus tard)
 		firstPlayer := getFirstPlayer(table)
 		if firstPlayer == -1 {
@@ -224,7 +232,7 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 
 // processRoundEnd gère la fin d'un tour
 func processRoundEnd(table *models.PlayingTable) {
-	// Trouver la meilleure carte de la couleur requise
+	// --- Recherche de la meilleure carte du tour ---
 	var bestCard string
 	bestSeat := -1
 	for _, played := range table.RoundPlayedCards {
@@ -235,13 +243,11 @@ func processRoundEnd(table *models.PlayingTable) {
 			}
 		}
 	}
-
 	if bestSeat == -1 {
-		// Fallback : prendre le premier siège avec des cartes jouées
 		if len(table.RoundPlayedCards) > 0 {
 			bestSeat = table.RoundPlayedCards[0].SeatIndex
+			bestCard = table.RoundPlayedCards[0].Card
 		} else {
-			// Très improbable, mais on prend le premier siège occupé
 			for i, seat := range table.Seats {
 				if seat.UserID != 0 {
 					bestSeat = i
@@ -255,73 +261,123 @@ func processRoundEnd(table *models.PlayingTable) {
 	table.LastRoundWinnerSeat = bestSeat
 
 	if table.CurrentRound == 5 {
-		table.HandWinnerSeat = bestSeat
-		table.DealerSeatIndex = bestSeat
-		AwardPotToWinner(table, bestSeat)
+		// Déterminer le type de Korat
+		koratType := 0 // 0 = aucun, 1 = simple, 2 = double
+		bonusMultiplier := 0
 
-		// Capturer l'ID du gagnant avant la goroutine
-		winnerUserID := uint(0)
-		if bestSeat >= 0 && bestSeat < len(table.Seats) {
-			winnerUserID = uint(table.Seats[bestSeat].UserID)
+		// Récupérer les cartes jouées par le gagnant (toutes)
+		winnerPlayedCards := table.SeatCards[bestSeat].Played
+		// On suppose que le gagnant a joué exactement 5 cartes (un par round)
+		if len(winnerPlayedCards) >= 5 {
+			cardRound4 := winnerPlayedCards[3] // index 3 = round 4 (0-based)
+			cardRound5 := winnerPlayedCards[4] // index 4 = round 5
+
+			valueRound4 := CardValue(cardRound4)
+			valueRound5 := CardValue(cardRound5)
+
+			// Vérifier les conditions
+			if valueRound4 == 3 && valueRound5 == 3 && table.Paid33 {
+				// Double Korat
+				koratType = 2
+				bonusMultiplier = 2
+				log.Printf("[DOUBLE KORAT] table=%s, gagnant siège=%d, cartes round4=%s, round5=%s, Paid33=true", table.ID, bestSeat, cardRound4, cardRound5)
+			} else if valueRound5 == 3 {
+				// Korat simple (si round5 = 3, peu importe round4)
+				koratType = 1
+				bonusMultiplier = 1
+				log.Printf("[KORAT] table=%s, gagnant siège=%d, carte round5=%s", table.ID, bestSeat, cardRound5)
+			} else {
+				// Pas de Korat
+				log.Printf("[PAS DE KORAT] table=%s, gagnant siège=%d, round5=%s", table.ID, bestSeat, cardRound5)
+			}
+		} else {
+			log.Printf("[PAS DE KORAT] table=%s, gagnant a moins de 5 cartes jouées", table.ID)
 		}
-		log.Printf("[ROUND_END] winnerSeat=%d, winnerUserID=%d", bestSeat, winnerUserID)
 
-		SaveAndNotify(table)
+		// Capturer les données pour la goroutine
+		tableCopy := *table
+		winnerSeat := bestSeat
+		winnerUserID := uint(0)
+		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+			winnerUserID = uint(table.Seats[winnerSeat].UserID)
+		}
 
-		go func(tableID string, winnerSeat int, winnerUserID uint) {
-			// 1. "Fin de manche" → immédiat
-			database.PublishGameEvent(tableID, "Fin de manche")
-			log.Printf("[ROUND_END] Fin de manche pour table %s", tableID)
+		if koratType > 0 {
+			// Lancement de la séquence Korat (prélèvement avec délai)
+			go func(t *models.PlayingTable, tid string, ws int, wu uint, kType int, multiplier int) {
+				// Envoyer l'événement "Korat !" (remplace "Fin de manche")
+				if kType == 2 {
+					database.PublishGameEvent(tid, "Double Korat !")
+				} else {
+					database.PublishGameEvent(tid, "Korat !")
+				}
 
-			time.Sleep(3 * time.Second)
+				// 1. Prélèvement sur les perdants
+				totalBonus := 0
+				for i, seat := range t.Seats {
+					if i != ws && t.ParticipatingSeats[i] && seat.UserID != 0 {
+						deduct := t.Bet * multiplier
+						if seat.AmountAtStake < deduct {
+							deduct = seat.AmountAtStake
+						}
+						if deduct > 0 {
+							t.Seats[i].AmountAtStake -= deduct
+							totalBonus += deduct
+							// Notification immédiate (comme en début de manche)
+							database.PublishSeatBetUpdate(tid, i, t.Seats[i].AmountAtStake, t.Bet)
+						}
+					}
+				}
 
-			// 2. "X gagne la manche" → après 3s
-			// Utiliser GetUsernameByUserID au lieu de GetUsernameFromSeat
-			username := GetUsernameByUserID(winnerUserID)
-			if username == "" {
-				username = fmt.Sprintf("Joueur %d", winnerUserID)
-			}
-			log.Printf("[ROUND_END] Gagnant: seat=%d, userID=%d, username=%s", winnerSeat, winnerUserID, username)
-			database.PublishGameEvent(tableID, username+" gagne la manche")
+				// Sauvegarde immédiate pour que les clients voient les nouveaux montants
+				tableJSON, _ := json.Marshal(t)
+				database.RedisClient.Set(database.Ctx, "table:"+tid, tableJSON, 24*time.Hour)
+				database.PublishTableUpdate(tid)
 
-			time.Sleep(3 * time.Second)
+				// 2. Attendre 3 secondes
+				time.Sleep(3 * time.Second)
 
-			// 3. "Début de la nouvelle manche dans quelques secondes" → après 6s
-			database.PublishGameEvent(tableID, "Début de la nouvelle manche")
+				// 3. Récupérer la table à jour et ajouter le bonus au pot
+				val, err := database.RedisClient.Get(database.Ctx, "table:"+tid).Result()
+				if err != nil {
+					log.Printf("Erreur récupération table après délai Korat: %v", err)
+					return
+				}
+				var updatedTable models.PlayingTable
+				if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
+					log.Printf("Erreur désérialisation après délai Korat: %v", err)
+					return
+				}
+				updatedTable.Pot += totalBonus
+				SaveAndNotify(&updatedTable)
+				database.PublishPotUpdate(tid, updatedTable.Pot)
 
-			time.Sleep(3 * time.Second)
+				time.Sleep(3 * time.Second)
 
-			// 4. Récupérer la table à jour, vider les mains et réinitialiser → après 9s
-			val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
-			if err != nil {
-				log.Printf("Erreur récupération table pour vidage: %v", err)
-				return
-			}
-			var updatedTable models.PlayingTable
-			if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
-				log.Printf("Erreur désérialisation pour vidage: %v", err)
-				return
-			}
+				// 4. Attribuer le pot (incluant le bonus) au gagnant
+				val2, _ := database.RedisClient.Get(database.Ctx, "table:"+tid).Result()
+				var finalTable models.PlayingTable
+				json.Unmarshal([]byte(val2), &finalTable)
+				AwardPotToWinner(&finalTable, ws)
+				finalTable.HandWinnerSeat = ws
+				finalTable.DealerSeatIndex = ws
+				SaveAndNotify(&finalTable)
 
-			// Réinitialiser les variables de la manche
-			updatedTable.CurrentRound = 0
-			updatedTable.SuitRequired = ""
-			updatedTable.RoundPlayedCards = []models.RoundCard{}
-			updatedTable.CurrentTurnSeatIndex = -1
+				// 5. Lancer la suite (annonce du gagnant, réinitialisation)
+				finalizeHand(tid, ws, wu, true) // koratTriggered = true
+			}(&tableCopy, table.ID, winnerSeat, winnerUserID, koratType, bonusMultiplier)
+		} else {
+			// Pas de Korat : attribution immédiate du pot
+			AwardPotToWinner(table, winnerSeat)
+			table.HandWinnerSeat = winnerSeat
+			table.DealerSeatIndex = winnerSeat
+			SaveAndNotify(table)
 
-			// Vider les mains et les cartes jouées
-			for i := range updatedTable.SeatCards {
-				updatedTable.SeatCards[i].Hand = []string{}
-				updatedTable.SeatCards[i].Played = []string{}
-			}
-
-			SaveAndNotify(&updatedTable)
-
-			// Lancer la nouvelle distribution
-			DistributeCardsForHand(tableID)
-		}(table.ID, bestSeat, winnerUserID)
+			// Lancer la fin de manche normale
+			go finalizeHand(table.ID, winnerSeat, winnerUserID, false)
+		}
 	} else {
-		// Tour suivant
+		// --- Tour suivant ---
 		table.CurrentRound++
 		table.CurrentTurnSeatIndex = table.RoundWinnerSeatIndex
 		if len(table.SeatCards[table.CurrentTurnSeatIndex].Hand) == 0 {
@@ -376,8 +432,7 @@ func startNewHand(tableID string) {
 		return
 	}
 	// On peut lancer la distribution progressive (comme dans SitAtTable)
-	// en utilisant une goroutine
-	go DistributeCardsForHand(tableID) // à définir
+	go DistributeCardsForHand(tableID)
 }
 
 // DistributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
@@ -395,6 +450,7 @@ func DistributeCardsForHand(tableID string) {
 	}
 
 	table.RevealedSeats = make([]bool, len(table.Seats))
+	table.ParticipatingSeats = make([]bool, len(table.Seats))
 
 	// Vider les mains de tous les joueurs au début
 	for i := range table.SeatCards {
@@ -570,4 +626,52 @@ func GetUsernameByUserID(userID uint) string {
 		return fmt.Sprintf("Joueur %d", userID)
 	}
 	return user.Username
+}
+
+// finalizeHand gère la fin de manche (annonce, réinitialisation, redistribution)
+func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTriggered bool) {
+	log.Printf("[finalizeHand] table=%s, winnerSeat=%d, winnerUserID=%d, korat=%v", tableID, winnerSeat, winnerUserID, koratTriggered)
+	// Si le Korat n'a pas été déclenché, on envoie "Fin de manche"
+	if !koratTriggered {
+		database.PublishGameEvent(tableID, "Fin de manche")
+	}
+	time.Sleep(3 * time.Second)
+
+	// Annonce du gagnant
+	username := GetUsernameByUserID(winnerUserID)
+	if username == "" {
+		username = fmt.Sprintf("Joueur %d", winnerUserID)
+	}
+	database.PublishGameEvent(tableID, username+" gagne la manche")
+	time.Sleep(3 * time.Second)
+
+	// Annonce de la prochaine manche
+	database.PublishGameEvent(tableID, "Début de la nouvelle manche")
+	time.Sleep(3 * time.Second)
+
+	// Réinitialisation de la table
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		log.Printf("Erreur récupération table pour vidage: %v", err)
+		return
+	}
+	var updatedTable models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
+		log.Printf("Erreur désérialisation pour vidage: %v", err)
+		return
+	}
+
+	updatedTable.CurrentRound = 0
+	updatedTable.SuitRequired = ""
+	updatedTable.RoundPlayedCards = []models.RoundCard{}
+	updatedTable.CurrentTurnSeatIndex = -1
+	updatedTable.ThreeSevenSeat = -1
+	for i := range updatedTable.SeatCards {
+		updatedTable.SeatCards[i].Hand = []string{}
+		updatedTable.SeatCards[i].Played = []string{}
+	}
+	SaveAndNotify(&updatedTable)
+
+	// Distribution des cartes pour la nouvelle manche
+	DistributeCardsForHand(tableID)
 }
