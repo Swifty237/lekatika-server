@@ -360,11 +360,14 @@ func processRoundEnd(table *models.PlayingTable) {
 					log.Printf("Erreur désérialisation après délai Korat: %v", err)
 					return
 				}
+
 				updatedTable.Pot += totalBonus
 				SaveAndNotify(&updatedTable)
 				database.PublishPotUpdate(tid, updatedTable.Pot)
 
-				time.Sleep(3 * time.Second)
+				time.Sleep(2 * time.Second)
+				database.PublishGameEvent(tid, "Attribution du bonus au gagnant")
+				time.Sleep(2 * time.Second)
 
 				// 4. Attribuer le pot (incluant le bonus) au gagnant
 				val2, _ := database.RedisClient.Get(database.Ctx, "table:"+tid).Result()

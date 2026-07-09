@@ -204,6 +204,7 @@ func AddAnnouncement(tableID string, seatIndex int, userID uint, annType string,
 	if table.RevealedSeats == nil {
 		table.RevealedSeats = make([]bool, len(table.Seats))
 	}
+
 	table.RevealedSeats[seatIndex] = true
 
 	// Sauvegarder la table avec les cartes révélées et notifier tous les clients
@@ -240,6 +241,29 @@ func AddAnnouncement(tableID string, seatIndex int, userID uint, annType string,
 
 	scheduleResolution(tableID)
 	log.Printf("[ANNONCE ACCEPTÉE] table=%s, user=%d, type=%s, value=%d", tableID, userID, annType, value)
+
+	// Récupérer le nom d'utilisateur
+	username := GetUsernameByUserID(userID)
+	if username == "" {
+		username = fmt.Sprintf("Joueur %d", userID)
+	}
+
+	// Convertir le type en français (déjà utilisé dans la partie rejet)
+	var typeName string
+	switch annType {
+	case "square":
+		typeName = "carré"
+	case "three_seven":
+		typeName = "3 sept"
+	case "tia":
+		typeName = "tia"
+	default:
+		typeName = annType
+	}
+
+	// Envoyer le message à tous les clients de la table
+	database.PublishGameEvent(tableID, fmt.Sprintf("%s annonce %s", username, typeName))
+
 	return nil
 }
 
