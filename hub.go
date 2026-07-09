@@ -122,6 +122,14 @@ func (c *Client) readPump(hub *Hub) {
 				controllers.HandleChatMessage(tableID, c.userID, content)
 			}
 
+		case "TOGGLE_BREAK":
+			tableID, _ := msg["tableId"].(string)
+			seatIdxFloat, _ := msg["seatIndex"].(float64)
+			seatIndex := int(seatIdxFloat)
+			if tableID != "" {
+				controllers.HandleToggleBreak(tableID, seatIndex, c.userID)
+			}
+
 		case "CHECK_SQUARE":
 			tableID, _ := msg["tableId"].(string)
 			seatIdxFloat, _ := msg["seatIndex"].(float64)

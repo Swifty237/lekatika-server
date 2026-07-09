@@ -95,7 +95,7 @@ func StartHand(table *models.PlayingTable) error {
 		// Initialiser la liste des participants (sièges occupés)
 		table.ParticipatingSeats = make([]bool, len(table.Seats))
 		for i, seat := range table.Seats {
-			if seat.UserID != 0 {
+			if seat.UserID != 0 && !table.PausedSeats[i] {
 				table.ParticipatingSeats[i] = true
 			}
 		}
@@ -112,7 +112,7 @@ func StartHand(table *models.PlayingTable) error {
 			// 1. Prélèvement des mises et mise à jour des sièges
 			totalPot := 0
 			for i, seat := range tableModel.Seats {
-				if seat.UserID == 0 {
+				if seat.UserID == 0 || tableModel.PausedSeats[i] {
 					continue
 				}
 
@@ -303,6 +303,7 @@ func processRoundEnd(table *models.PlayingTable) {
 		}
 
 		if koratType > 0 {
+
 			// Lancement de la séquence Korat (prélèvement avec délai)
 			go func(t *models.PlayingTable, tid string, ws int, wu uint, kType int, multiplier int) {
 				// Envoyer l'événement "Korat !" (remplace "Fin de manche")
@@ -311,6 +312,15 @@ func processRoundEnd(table *models.PlayingTable) {
 				} else {
 					database.PublishGameEvent(tid, "Korat !")
 				}
+
+				// Envoyer un événement KORAT_START avec le siège du gagnant
+				koratEvent := map[string]interface{}{
+					"type":       "KORAT_START",
+					"winnerSeat": ws,
+					"koratType":  kType, // 1 ou 2
+				}
+				koratJSON, _ := json.Marshal(koratEvent)
+				database.RedisClient.Publish(database.Ctx, "tables", koratJSON)
 
 				// 1. Prélèvement sur les perdants
 				totalBonus := 0
@@ -321,10 +331,12 @@ func processRoundEnd(table *models.PlayingTable) {
 							deduct = seat.AmountAtStake
 						}
 						if deduct > 0 {
+							log.Printf("[KORAT] Vérification siège %d : participant=%v, UserID=%d, ws=%d", i, t.ParticipatingSeats[i], seat.UserID, ws)
 							t.Seats[i].AmountAtStake -= deduct
-							totalBonus += deduct
+
 							// Notification immédiate (comme en début de manche)
-							database.PublishSeatBetUpdate(tid, i, t.Seats[i].AmountAtStake, t.Bet)
+							database.PublishKoratSeatBetUpdate(tid, i, t.Seats[i].AmountAtStake, t.Bet, ws)
+							totalBonus += deduct
 						}
 					}
 				}
@@ -360,8 +372,23 @@ func processRoundEnd(table *models.PlayingTable) {
 				json.Unmarshal([]byte(val2), &finalTable)
 				AwardPotToWinner(&finalTable, ws)
 				finalTable.HandWinnerSeat = ws
-				finalTable.DealerSeatIndex = ws
+
+				// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
+				nextDealer := ws
+				if ws >= 0 && ws < len(finalTable.Seats) {
+					if finalTable.Seats[ws].UserID == 0 || finalTable.PausedSeats[ws] {
+						start := (ws + 1) % len(finalTable.Seats)
+						nextDealer = getNextActiveSeat(&finalTable, start)
+						if nextDealer == -1 {
+							nextDealer = ws
+						}
+						log.Printf("[DEALER KORAT] Gagnant siège %d en pause, nouveau dealer = %d", ws, nextDealer)
+					}
+				}
+				finalTable.DealerSeatIndex = nextDealer
+
 				SaveAndNotify(&finalTable)
+				log.Printf("[Korat] Après AwardPotToWinner et sauvegarde, sièges : %+v", finalTable.Seats)
 
 				// 5. Lancer la suite (annonce du gagnant, réinitialisation)
 				finalizeHand(tid, ws, wu, true) // koratTriggered = true
@@ -370,9 +397,24 @@ func processRoundEnd(table *models.PlayingTable) {
 			// Pas de Korat : attribution immédiate du pot
 			AwardPotToWinner(table, winnerSeat)
 			table.HandWinnerSeat = winnerSeat
-			table.DealerSeatIndex = winnerSeat
-			SaveAndNotify(table)
 
+			// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
+			nextDealer := winnerSeat
+			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+				if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+					start := (winnerSeat + 1) % len(table.Seats)
+					nextDealer = getNextActiveSeat(table, start)
+					if nextDealer == -1 {
+						// Aucun joueur actif : on garde le gagnant (normalement impossible)
+						nextDealer = winnerSeat
+					}
+					log.Printf("[DEALER] Gagnant siège %d en pause ou vide, nouveau dealer = %d", winnerSeat, nextDealer)
+				}
+			}
+			table.DealerSeatIndex = nextDealer
+
+			SaveAndNotify(table)
+			log.Printf("[FIN DE MANCHE] Pas de Korat, après attribution du pot et sauvegarde, sièges : %+v", table.Seats)
 			// Lancer la fin de manche normale
 			go finalizeHand(table.ID, winnerSeat, winnerUserID, false)
 		}
@@ -471,8 +513,8 @@ func DistributeCardsForHand(tableID string) {
 
 	// Vérifier qu'il y a au moins 2 joueurs assis
 	occupied := 0
-	for _, seat := range table.Seats {
-		if seat.UserID != 0 {
+	for i, seat := range table.Seats {
+		if seat.UserID != 0 && !table.PausedSeats[i] {
 			occupied++
 		}
 	}
@@ -484,21 +526,29 @@ func DistributeCardsForHand(tableID string) {
 
 	// Déterminer le dealer
 	dealerIdx := table.DealerSeatIndex
-	if dealerIdx == -1 {
-		for i, seat := range table.Seats {
-			if seat.UserID != 0 {
-				dealerIdx = i
-				table.DealerSeatIndex = i
-				break
-			}
+
+	// Si le dealer n'est pas défini, ou que le siège est vide ou en pause, chercher un nouveau dealer actif
+	if dealerIdx == -1 || table.Seats[dealerIdx].UserID == 0 || table.PausedSeats[dealerIdx] {
+		// On part du dealer précédent ou de 0 si inexistant
+		start := 0
+		if dealerIdx != -1 {
+			start = (dealerIdx + 1) % len(table.Seats)
 		}
+		newDealer := getNextActiveSeat(&table, start)
+		if newDealer == -1 {
+			log.Printf("DistributeCardsForHand: aucun joueur actif trouvé, impossible de distribuer")
+			return
+		}
+		dealerIdx = newDealer
+		table.DealerSeatIndex = dealerIdx
 	}
 
-	// --- CORRECTION : Construire l'ordre circulaire à partir du dealer ---
+	log.Printf("[DistributeCards] État des sièges avant distribution : %+v", table.Seats)
+
 	// Récupérer tous les sièges occupés
 	occupiedSeats := []int{}
 	for i, seat := range table.Seats {
-		if seat.UserID != 0 {
+		if seat.UserID != 0 && !table.PausedSeats[i] {
 			occupiedSeats = append(occupiedSeats, i)
 		}
 	}
@@ -506,9 +556,8 @@ func DistributeCardsForHand(tableID string) {
 	// Trier les sièges dans l'ordre circulaire en partant de dealer+1
 	seatsIndices := []int{}
 	n := len(table.Seats)
-	// On commence par le siège après le dealer
 	start := (dealerIdx + 1) % n
-	for i := 0; i < len(occupiedSeats); i++ {
+	for i := 0; i < n; i++ {
 		idx := (start + i) % n
 		// Vérifier si ce siège est occupé
 		for _, occ := range occupiedSeats {
@@ -518,6 +567,7 @@ func DistributeCardsForHand(tableID string) {
 			}
 		}
 	}
+
 	// Si le dealer n'est pas le dernier, on l'ajoute s'il est occupé (il doit l'être)
 	if dealerIdx >= 0 && table.Seats[dealerIdx].UserID != 0 {
 		// Il est déjà dans la liste? On le met à la fin
@@ -533,7 +583,6 @@ func DistributeCardsForHand(tableID string) {
 	}
 
 	log.Printf("DistributeCards: dealerIdx=%d, seatsIndices=%v", dealerIdx, seatsIndices)
-	// --- Fin correction ---
 
 	// Créer un nouveau deck
 	table.Deck = createDeck()
@@ -655,11 +704,14 @@ func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTrigge
 		log.Printf("Erreur récupération table pour vidage: %v", err)
 		return
 	}
+
 	var updatedTable models.PlayingTable
 	if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
 		log.Printf("Erreur désérialisation pour vidage: %v", err)
 		return
 	}
+
+	log.Printf("[finalizeHand] Table récupérée depuis Redis : Seats=%+v", updatedTable.Seats)
 
 	updatedTable.CurrentRound = 0
 	updatedTable.SuitRequired = ""
@@ -670,8 +722,46 @@ func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTrigge
 		updatedTable.SeatCards[i].Hand = []string{}
 		updatedTable.SeatCards[i].Played = []string{}
 	}
+
 	SaveAndNotify(&updatedTable)
 
 	// Distribution des cartes pour la nouvelle manche
 	DistributeCardsForHand(tableID)
+}
+
+func HandleToggleBreak(tableID string, seatIndex int, userID uint) {
+	// Récupérer la table
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		log.Printf("Erreur récupération table pour toggle break: %v", err)
+		return
+	}
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		log.Printf("Erreur désérialisation: %v", err)
+		return
+	}
+	// Vérifier le siège et l'utilisateur
+	if seatIndex < 0 || seatIndex >= len(table.Seats) || uint(table.Seats[seatIndex].UserID) != userID {
+		log.Printf("Tentative de toggle break sur mauvais siège")
+		return
+	}
+	// Inverser l'état
+	table.PausedSeats[seatIndex] = !table.PausedSeats[seatIndex]
+	// Sauvegarder et notifier
+	SaveAndNotify(&table)
+	log.Printf("[BREAK] Table %s, siège %d, nouvel état: %v", tableID, seatIndex, table.PausedSeats[seatIndex])
+}
+
+// getNextActiveSeat retourne le prochain siège occupé et non en pause à partir d'un index de départ.
+// Si aucun trouvé, retourne -1.
+func getNextActiveSeat(table *models.PlayingTable, start int) int {
+	n := len(table.Seats)
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if table.Seats[idx].UserID != 0 && !table.PausedSeats[idx] {
+			return idx
+		}
+	}
+	return -1
 }

@@ -101,6 +101,21 @@ func PublishSeatBetUpdate(tableID string, seatIndex int, newAmountAtStake int, s
 	RedisClient.Publish(Ctx, "tables", eventJSON)
 }
 
+func PublishKoratSeatBetUpdate(tableID string, seatIndex int, newAmountAtStake int, seatBet int, winnerSeat ...int) {
+	payload := map[string]interface{}{
+		"type":             "SEAT_BET_UPDATE",
+		"tableId":          tableID,
+		"seatIndex":        seatIndex,
+		"newAmountAtStake": newAmountAtStake,
+		"seatBet":          seatBet,
+	}
+	if len(winnerSeat) > 0 && winnerSeat[0] >= 0 {
+		payload["winnerSeat"] = winnerSeat[0]
+	}
+	data, _ := json.Marshal(payload)
+	RedisClient.Publish(Ctx, "tables", data)
+}
+
 // PublishPotUpdate notifie le front pour mettre à jour le pot et réinitialiser seatBet
 func PublishPotUpdate(tableID string, pot int) {
 	event := map[string]interface{}{
