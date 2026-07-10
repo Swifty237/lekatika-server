@@ -48,6 +48,9 @@ func main() {
 		MaxAge:           12 * time.Hour,
 	}))
 
+	// Servir les fichiers statiques du dossier uploads
+	router.Static("/uploads", "./uploads")
+
 	// Routes publiques (authentification)
 	authGroup := router.Group("/api/auth")
 	{
@@ -72,6 +75,8 @@ func main() {
 		protected.POST("/logout", controllers.Logout)
 		protected.POST("/tables/:id/sit/:seatId", controllers.SitAtTable)
 		protected.POST("/tables/:id/unseat", controllers.UnseatFromTable)
+		protected.POST("/user/profile-picture", controllers.UpdateProfilePicture)
+		protected.GET("/users/:id", controllers.GetUserByID)
 	}
 
 	router.Run("localhost:8080")
