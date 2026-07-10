@@ -300,6 +300,16 @@ func processRoundEnd(table *models.PlayingTable) {
 	table.RoundWinnerSeatIndex = bestSeat
 	table.LastRoundWinnerSeat = bestSeat
 
+	// Enregistrer l'historique du round
+	entry := models.RoundHistoryEntry{
+		RoundNumber:  table.CurrentRound,
+		SuitRequired: table.SuitRequired,
+		PlayedCards:  table.RoundPlayedCards,
+		WinnerSeat:   bestSeat,
+		WinnerCard:   bestCard,
+	}
+	table.RoundHistory = append(table.RoundHistory, entry)
+
 	if table.CurrentRound == 5 {
 		// Déterminer le type de Korat
 		koratType := 0 // 0 = aucun, 1 = simple, 2 = double

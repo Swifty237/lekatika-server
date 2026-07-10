@@ -110,6 +110,7 @@ func CreateTable(c *gin.Context) {
 		PausedSeats:           []bool{false, false, false, false},
 		IsDealing:             false,
 		DistributionCancelled: false,
+		RoundHistory:          []models.RoundHistoryEntry{},
 	}
 
 	// Stocker dans Redis (clé: table:{ID})
@@ -760,65 +761,94 @@ func createDeck() []string {
 
 // advanceTurnAfterLeave avance le tour si le joueur actuel a quitté
 func advanceTurnAfterLeave(table *models.PlayingTable) {
-	// Chercher le prochain joueur valide (occupé, avec des cartes, n'ayant pas encore joué dans ce tour)
-	nextPlayer := getNextSeatIndexInTurn(table, table.CurrentTurnSeatIndex)
+	// Si aucune manche en cours ou pas de tour, on ne fait rien
+	if !table.GameStarted || table.CurrentRound == 0 {
+		return
+	}
+
+	// Cas où le joueur se lève alors que ce n'est pas son tour : on ne fait rien (le tour reste sur le joueur suivant déjà)
+	// Mais on vérifie : si le joueur actuel est vide, on doit avancer.
+	seatIdx := table.CurrentTurnSeatIndex
+	if seatIdx < 0 || seatIdx >= len(table.Seats) || table.Seats[seatIdx].UserID != 0 {
+		// Le joueur actuel est toujours là, rien à faire
+		return
+	}
+
+	// Si la couleur demandée est non vide, ou que c'est le round 1, on utilise la méthode normale (prochain siège avec des cartes)
+	if table.SuitRequired != "" || table.CurrentRound == 1 {
+		nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
+		if nextPlayer != -1 {
+			table.CurrentTurnSeatIndex = nextPlayer
+			SaveAndNotify(table)
+			return
+		}
+		// Sinon, plus de joueur, on finit la manche
+		handleNoActivePlayers(table)
+		return
+	}
+
+	// Cas : round > 1 et SuitRequired vide (tour pas encore commencé)
+	// On doit trouver le joueur qui avait la deuxième meilleure carte au round précédent
+	if len(table.RoundHistory) >= 2 {
+		prevRound := table.RoundHistory[len(table.RoundHistory)-1] // dernier round enregistré
+		// Récupérer les cartes du round précédent pour chaque siège
+		// On a prevRound.PlayedCards qui est un []RoundCard avec SeatIndex et Card
+		// On doit trouver le meilleur (celui qui a gagné) et le deuxième meilleur
+		// Le meilleur est prevRound.WinnerSeat, qui est le joueur parti.
+		// On cherche le deuxième meilleur parmi les autres.
+
+		// Filtrer les cartes des autres joueurs (différents de winnerSeat)
+		var bestCard string
+		var secondBestSeat int
+		for _, played := range prevRound.PlayedCards {
+			if played.SeatIndex == prevRound.WinnerSeat {
+				continue
+			}
+			// Comparer selon la couleur (SuitRequired) du round précédent
+			if cardSuit(played.Card) == prevRound.SuitRequired {
+				if bestCard == "" || CardValue(played.Card) > CardValue(bestCard) {
+					bestCard = played.Card
+					secondBestSeat = played.SeatIndex
+				}
+			}
+		}
+		// Fallback : si personne n'a de carte de la couleur, prendre le premier joueur disponible
+		if secondBestSeat == -1 {
+			nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
+			if nextPlayer != -1 {
+				table.CurrentTurnSeatIndex = nextPlayer
+				SaveAndNotify(table)
+				return
+			}
+			handleNoActivePlayers(table)
+			return
+		}
+
+		// Vérifier que ce joueur est toujours participant (a des cartes)
+		if len(table.SeatCards[secondBestSeat].Hand) == 0 {
+			// Il n'a plus de cartes, on passe au suivant
+			nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
+			if nextPlayer != -1 {
+				table.CurrentTurnSeatIndex = nextPlayer
+				SaveAndNotify(table)
+				return
+			}
+			handleNoActivePlayers(table)
+			return
+		}
+
+		table.CurrentTurnSeatIndex = secondBestSeat
+		SaveAndNotify(table)
+		log.Printf("Tour attribué au deuxième meilleur du round précédent (siège %d)", secondBestSeat)
+		return
+	}
+
+	// Fallback : si pas d'historique, on utilise la méthode normale
+	nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
 	if nextPlayer != -1 {
 		table.CurrentTurnSeatIndex = nextPlayer
 		SaveAndNotify(table)
 		return
 	}
-
-	// Si aucun joueur ne peut jouer, terminer la manche
-	// Compter les participants restants
-	activePlayers := 0
-	lastSeat := -1
-	for i, seat := range table.Seats {
-		if seat.UserID != 0 && len(table.SeatCards[i].Hand) > 0 {
-			activePlayers++
-			lastSeat = i
-		}
-	}
-
-	if activePlayers == 0 {
-		// Plus aucun joueur avec des cartes : annuler la manche
-		database.PublishGameEvent(table.ID, "Manche annulée, plus de joueurs")
-		table.Pot = 0
-		resetHand(table)
-		SaveAndNotify(table)
-		go finalizeHand(table.ID, -1, 0, false, false) // -1 signifie pas de gagnant
-	} else if activePlayers == 1 {
-		// Un seul joueur restant : il gagne
-		winnerSeat := lastSeat
-		winnerUserID := uint(table.Seats[winnerSeat].UserID)
-		username := GetUsernameByUserID(winnerUserID)
-		database.PublishGameEvent(table.ID, fmt.Sprintf("%s gagne la manche par abandon !", username))
-		AwardPotToWinner(table, winnerSeat)
-		table.HandWinnerSeat = winnerSeat
-		// Déterminer le prochain dealer
-		nextDealer := winnerSeat
-		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
-			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
-				start := (winnerSeat + 1) % len(table.Seats)
-				nextDealer = getNextActiveSeat(table, start)
-				if nextDealer == -1 {
-					nextDealer = winnerSeat
-				}
-			}
-		}
-		table.DealerSeatIndex = nextDealer
-		SaveAndNotify(table)
-		go finalizeHand(table.ID, winnerSeat, winnerUserID, false, true)
-	} else {
-		// Normalement, s'il y a plusieurs joueurs, getNextSeatIndexInTurn aurait trouvé un joueur
-		// Mais on prévient au cas où
-		log.Printf("advanceTurnAfterLeave: impossible de trouver un joueur pour le tour, mais il y a %d participants", activePlayers)
-		// On réinitialise le tour en prenant le premier joueur avec des cartes
-		for i, seat := range table.Seats {
-			if seat.UserID != 0 && len(table.SeatCards[i].Hand) > 0 {
-				table.CurrentTurnSeatIndex = i
-				SaveAndNotify(table)
-				break
-			}
-		}
-	}
+	handleNoActivePlayers(table)
 }
