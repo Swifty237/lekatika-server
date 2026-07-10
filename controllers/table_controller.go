@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"lekatika-server/database"
 	"lekatika-server/models"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -70,43 +71,45 @@ func CreateTable(c *gin.Context) {
 			{Hand: []string{}, Played: []string{}},
 			{Hand: []string{}, Played: []string{}},
 		},
-		DealerSeatIndex:      -1,
-		Turn:                 "",
-		LastWinningSeat:      "",
-		LastRoundWinner:      "",
-		ThreeSevenSeat:       -1,
-		Pot:                  0,
-		HandOver:             false,
-		HandCompleted:        false,
-		WinMessages:          []string{},
-		GameNotifications:    []string{},
-		History:              []string{},
-		SeatTurnTimer:        []string{},
-		DemandedSuit:         []string{},
-		CurrentRoundCards:    []string{},
-		RoundNumber:          0,
-		CountHand:            0,
-		HandParticipants:     []string{},
-		WonByCombination:     false,
-		OnTurnChanged:        []string{},
-		ChatRoom:             []string{},
-		ChatMessages:         []models.ChatMessage{},
-		InviteLink:           inviteLink,
-		DisconnectedAt:       []int64{0, 0, 0, 0},
-		Deck:                 []string{},
-		GameStarted:          false,
-		Starting:             false,
-		Dealing:              false,
-		CurrentRound:         0,
-		CurrentTurnSeatIndex: -1,
-		SuitRequired:         "",
-		RoundPlayedCards:     []models.RoundCard{},
-		RoundWinnerSeatIndex: -1,
-		LastRoundWinnerSeat:  -1,
-		HandWinnerSeat:       -1,
-		RevealedSeats:        []bool{false, false, false, false},
-		ParticipatingSeats:   []bool{false, false, false, false},
-		PausedSeats:          []bool{false, false, false, false},
+		DealerSeatIndex:       -1,
+		Turn:                  "",
+		LastWinningSeat:       "",
+		LastRoundWinner:       "",
+		ThreeSevenSeat:        -1,
+		Pot:                   0,
+		HandOver:              false,
+		HandCompleted:         false,
+		WinMessages:           []string{},
+		GameNotifications:     []string{},
+		History:               []string{},
+		SeatTurnTimer:         []string{},
+		DemandedSuit:          []string{},
+		CurrentRoundCards:     []string{},
+		RoundNumber:           0,
+		CountHand:             0,
+		HandParticipants:      []string{},
+		WonByCombination:      false,
+		OnTurnChanged:         []string{},
+		ChatRoom:              []string{},
+		ChatMessages:          []models.ChatMessage{},
+		InviteLink:            inviteLink,
+		DisconnectedAt:        []int64{0, 0, 0, 0},
+		Deck:                  []string{},
+		GameStarted:           false,
+		Starting:              false,
+		Dealing:               false,
+		CurrentRound:          0,
+		CurrentTurnSeatIndex:  -1,
+		SuitRequired:          "",
+		RoundPlayedCards:      []models.RoundCard{},
+		RoundWinnerSeatIndex:  -1,
+		LastRoundWinnerSeat:   -1,
+		HandWinnerSeat:        -1,
+		RevealedSeats:         []bool{false, false, false, false},
+		ParticipatingSeats:    []bool{false, false, false, false},
+		PausedSeats:           []bool{false, false, false, false},
+		IsDealing:             false,
+		DistributionCancelled: false,
 	}
 
 	// Stocker dans Redis (clé: table:{ID})
@@ -296,6 +299,24 @@ func LeaveTable(c *gin.Context) {
 		table.SeatsConnected[seatIndex] = false
 	}
 
+	// Sauvegarder la table
+	SaveAndNotify(&table)
+
+	// Après avoir retiré le joueur et sauvegardé
+	if table.GameStarted && table.CurrentTurnSeatIndex == seatIndex {
+		advanceTurnAfterLeave(&table)
+	}
+
+	// Si une distribution est en cours, on annule
+	if table.IsDealing {
+		table.DistributionCancelled = true
+		SaveAndNotify(&table)
+		// Ne pas appeler checkAndHandleHandEndOnLeave ici, ce sera fait par DistributeCardsForHand
+	}
+
+	// Vérifier la fin de manche
+	checkAndHandleHandEndOnLeave(&table)
+
 	if table.DealerSeatIndex == seatIndex {
 		newDealer := -1
 		for i, seat := range table.Seats {
@@ -434,6 +455,32 @@ func SitAtTable(c *gin.Context) {
 
 	if seatIndex >= len(table.Seats) || table.Seats[seatIndex].UserID != 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "Seat already taken"})
+		return
+	}
+
+	// Vérifier si une distribution est en cours
+	if table.IsDealing {
+		// Ajouter la demande dans Redis (liste) pour éviter les écrasements
+		pendingKey := "table:" + tableID + ":pending_sits"
+		req := models.PendingSitRequest{
+			UserID:    userID.(uint),
+			SeatIndex: seatIndex,
+			Amount:    input.Amount,
+			Timestamp: time.Now().UnixNano(),
+		}
+		reqJSON, _ := json.Marshal(req)
+		err := database.RedisClient.RPush(database.Ctx, pendingKey, reqJSON).Err()
+		if err != nil {
+			log.Printf("Erreur lors de l'ajout de la demande en attente: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Erreur interne"})
+			return
+		}
+
+		// Répondre au client (sans modifier la table)
+		c.JSON(http.StatusAccepted, gin.H{
+			"message": "distribution en cours",
+			"table":   table, // la table actuelle (sans le joueur)
+		})
 		return
 	}
 
@@ -611,6 +658,24 @@ func UnseatFromTable(c *gin.Context) {
 	table.Seats[seatIndex].AmountAtStake = 0
 	table.SeatsConnected[seatIndex] = false
 
+	// Sauvegarder la table
+	SaveAndNotify(&table)
+
+	// Après avoir retiré le joueur et sauvegardé
+	if table.GameStarted && table.CurrentTurnSeatIndex == seatIndex {
+		advanceTurnAfterLeave(&table)
+	}
+
+	// Si une distribution est en cours, on annule
+	if table.IsDealing {
+		table.DistributionCancelled = true
+		SaveAndNotify(&table)
+		// Ne pas appeler checkAndHandleHandEndOnLeave ici, ce sera fait par DistributeCardsForHand
+	}
+
+	// Vérifier la fin de manche
+	checkAndHandleHandEndOnLeave(&table)
+
 	if table.DealerSeatIndex == seatIndex {
 		newDealer := -1
 		for i, seat := range table.Seats {
@@ -691,4 +756,69 @@ func createDeck() []string {
 		deck[i], deck[j] = deck[j], deck[i]
 	})
 	return deck
+}
+
+// advanceTurnAfterLeave avance le tour si le joueur actuel a quitté
+func advanceTurnAfterLeave(table *models.PlayingTable) {
+	// Chercher le prochain joueur valide (occupé, avec des cartes, n'ayant pas encore joué dans ce tour)
+	nextPlayer := getNextSeatIndexInTurn(table, table.CurrentTurnSeatIndex)
+	if nextPlayer != -1 {
+		table.CurrentTurnSeatIndex = nextPlayer
+		SaveAndNotify(table)
+		return
+	}
+
+	// Si aucun joueur ne peut jouer, terminer la manche
+	// Compter les participants restants
+	activePlayers := 0
+	lastSeat := -1
+	for i, seat := range table.Seats {
+		if seat.UserID != 0 && len(table.SeatCards[i].Hand) > 0 {
+			activePlayers++
+			lastSeat = i
+		}
+	}
+
+	if activePlayers == 0 {
+		// Plus aucun joueur avec des cartes : annuler la manche
+		database.PublishGameEvent(table.ID, "Manche annulée, plus de joueurs")
+		table.Pot = 0
+		resetHand(table)
+		SaveAndNotify(table)
+		go finalizeHand(table.ID, -1, 0, false, false) // -1 signifie pas de gagnant
+	} else if activePlayers == 1 {
+		// Un seul joueur restant : il gagne
+		winnerSeat := lastSeat
+		winnerUserID := uint(table.Seats[winnerSeat].UserID)
+		username := GetUsernameByUserID(winnerUserID)
+		database.PublishGameEvent(table.ID, fmt.Sprintf("%s gagne la manche par abandon !", username))
+		AwardPotToWinner(table, winnerSeat)
+		table.HandWinnerSeat = winnerSeat
+		// Déterminer le prochain dealer
+		nextDealer := winnerSeat
+		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+				start := (winnerSeat + 1) % len(table.Seats)
+				nextDealer = getNextActiveSeat(table, start)
+				if nextDealer == -1 {
+					nextDealer = winnerSeat
+				}
+			}
+		}
+		table.DealerSeatIndex = nextDealer
+		SaveAndNotify(table)
+		go finalizeHand(table.ID, winnerSeat, winnerUserID, false, true)
+	} else {
+		// Normalement, s'il y a plusieurs joueurs, getNextSeatIndexInTurn aurait trouvé un joueur
+		// Mais on prévient au cas où
+		log.Printf("advanceTurnAfterLeave: impossible de trouver un joueur pour le tour, mais il y a %d participants", activePlayers)
+		// On réinitialise le tour en prenant le premier joueur avec des cartes
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && len(table.SeatCards[i].Hand) > 0 {
+				table.CurrentTurnSeatIndex = i
+				SaveAndNotify(table)
+				break
+			}
+		}
+	}
 }

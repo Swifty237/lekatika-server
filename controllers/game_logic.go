@@ -7,6 +7,8 @@ import (
 	"lekatika-server/models"
 	"log"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // Fonctions auxiliaires pour les cartes
@@ -75,8 +77,8 @@ func StartHand(table *models.PlayingTable) error {
 	if table.GameStarted && table.CurrentRound == 0 {
 		// Vérifier qu'il y a au moins 2 joueurs assis
 		occupied := 0
-		for _, seat := range table.Seats {
-			if seat.UserID != 0 {
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && !table.PausedSeats[i] {
 				occupied++
 			}
 		}
@@ -147,6 +149,7 @@ func StartHand(table *models.PlayingTable) error {
 				log.Printf("Erreur récupération table après délai: %v", err)
 				return
 			}
+
 			var updatedTable models.PlayingTable
 			if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
 				log.Printf("Erreur désérialisation table après délai: %v", err)
@@ -169,6 +172,26 @@ func StartHand(table *models.PlayingTable) error {
 }
 
 func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) error {
+
+	// Vérifier que le siège est occupé
+	if table.Seats[seatIndex].UserID == 0 {
+		return fmt.Errorf("seat is empty")
+	}
+
+	// Si le joueur actuel n'est pas celui-ci, on vérifie s'il est vide
+	if table.CurrentTurnSeatIndex != seatIndex {
+		// Si le joueur actuel a quitté, avancer le tour
+		if table.Seats[table.CurrentTurnSeatIndex].UserID == 0 {
+			advanceTurnAfterLeave(table)
+			// Re-vérifier si le tour est maintenant sur ce siège
+			if table.CurrentTurnSeatIndex != seatIndex {
+				return fmt.Errorf("not your turn")
+			}
+		} else {
+			return fmt.Errorf("not your turn")
+		}
+	}
+
 	// Vérifier que c'est le tour du joueur
 	if table.CurrentTurnSeatIndex != seatIndex {
 		return fmt.Errorf("not your turn")
@@ -232,6 +255,23 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 
 // processRoundEnd gère la fin d'un tour
 func processRoundEnd(table *models.PlayingTable) {
+
+	// Sécurité : si aucune carte n'a été jouée dans ce tour, avancer le tour ou terminer
+	if len(table.RoundPlayedCards) == 0 {
+		log.Printf("processRoundEnd appelé alors qu'aucune carte n'a été jouée, tentative de récupération")
+		// Chercher un joueur valide pour le prochain tour
+		nextPlayer := getNextSeatIndexInTurn(table, table.CurrentTurnSeatIndex)
+		if nextPlayer != -1 {
+			table.CurrentTurnSeatIndex = nextPlayer
+			SaveAndNotify(table)
+			return
+		}
+		// Si aucun joueur trouvé, la manche est terminée
+		// On va simuler une fin de manche sans vainqueur (abandon)
+		handleNoActivePlayers(table)
+		return
+	}
+
 	// --- Recherche de la meilleure carte du tour ---
 	var bestCard string
 	bestSeat := -1
@@ -394,7 +434,7 @@ func processRoundEnd(table *models.PlayingTable) {
 				log.Printf("[Korat] Après AwardPotToWinner et sauvegarde, sièges : %+v", finalTable.Seats)
 
 				// 5. Lancer la suite (annonce du gagnant, réinitialisation)
-				finalizeHand(tid, ws, wu, true) // koratTriggered = true
+				finalizeHand(tid, ws, wu, true, false) // koratTriggered = true, fromAbandon = false
 			}(&tableCopy, table.ID, winnerSeat, winnerUserID, koratType, bonusMultiplier)
 		} else {
 			// Pas de Korat : attribution immédiate du pot
@@ -419,7 +459,7 @@ func processRoundEnd(table *models.PlayingTable) {
 			SaveAndNotify(table)
 			log.Printf("[FIN DE MANCHE] Pas de Korat, après attribution du pot et sauvegarde, sièges : %+v", table.Seats)
 			// Lancer la fin de manche normale
-			go finalizeHand(table.ID, winnerSeat, winnerUserID, false)
+			go finalizeHand(table.ID, winnerSeat, winnerUserID, false, false) // koratTriggered = false, fromAbandon = false
 		}
 	} else {
 		// --- Tour suivant ---
@@ -468,8 +508,8 @@ func startNewHand(tableID string) {
 	}
 	// Si la table n'a pas au moins 2 joueurs, ne pas distribuer
 	occupied := 0
-	for _, seat := range table.Seats {
-		if seat.UserID != 0 {
+	for i, seat := range table.Seats {
+		if seat.UserID != 0 && !table.PausedSeats[i] {
 			occupied++
 		}
 	}
@@ -482,7 +522,7 @@ func startNewHand(tableID string) {
 
 // DistributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
 func DistributeCardsForHand(tableID string) {
-	// Récupérer la table
+	// 1. Récupérer la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		log.Printf("distributeCardsForHand: impossible de récupérer la table %s", tableID)
@@ -494,52 +534,48 @@ func DistributeCardsForHand(tableID string) {
 		return
 	}
 
+	// 2. Marquer la distribution comme en cours
+	table.IsDealing = true
+	SaveAndNotify(&table)
+
+	// 3. Réinitialiser les données de la manche
 	table.RevealedSeats = make([]bool, len(table.Seats))
 	table.ParticipatingSeats = make([]bool, len(table.Seats))
-
-	// Vider les mains de tous les joueurs au début
 	for i := range table.SeatCards {
 		table.SeatCards[i].Hand = []string{}
 		table.SeatCards[i].Played = []string{}
 	}
-
 	database.ClearAnnouncements(tableID)
-
-	// Réinitialiser ThreeSevenSeat
-	table.ThreeSevenSeat = -1
-
-	// Sauvegarder et notifier la table avec les mains vidées
 	SaveAndNotify(&table)
-
-	// Attendre 300ms pour que les clients reçoivent la mise à jour
 	time.Sleep(300 * time.Millisecond)
 
-	// Vérifier qu'il y a au moins 2 joueurs assis
-	occupied := 0
+	// 4. Vérifier qu'il y a au moins 2 joueurs actifs (non en pause)
+	occupiedSeats := []int{}
 	for i, seat := range table.Seats {
 		if seat.UserID != 0 && !table.PausedSeats[i] {
-			occupied++
+			occupiedSeats = append(occupiedSeats, i)
 		}
 	}
-
-	if occupied < 2 {
-		log.Printf("distributeCardsForHand: pas assez de joueurs (%d)", occupied)
+	if len(occupiedSeats) < 2 {
+		log.Printf("distributeCardsForHand: pas assez de joueurs (%d)", len(occupiedSeats))
+		// Désactiver le flag de distribution
+		table.IsDealing = false
+		SaveAndNotify(&table)
 		return
 	}
 
-	// Déterminer le dealer
+	// 5. Déterminer le dealer
 	dealerIdx := table.DealerSeatIndex
-
-	// Si le dealer n'est pas défini, ou que le siège est vide ou en pause, chercher un nouveau dealer actif
 	if dealerIdx == -1 || table.Seats[dealerIdx].UserID == 0 || table.PausedSeats[dealerIdx] {
-		// On part du dealer précédent ou de 0 si inexistant
 		start := 0
 		if dealerIdx != -1 {
 			start = (dealerIdx + 1) % len(table.Seats)
 		}
 		newDealer := getNextActiveSeat(&table, start)
 		if newDealer == -1 {
-			log.Printf("DistributeCardsForHand: aucun joueur actif trouvé, impossible de distribuer")
+			log.Printf("DistributeCardsForHand: aucun joueur actif trouvé")
+			table.IsDealing = false
+			SaveAndNotify(&table)
 			return
 		}
 		dealerIdx = newDealer
@@ -548,21 +584,12 @@ func DistributeCardsForHand(tableID string) {
 
 	log.Printf("[DistributeCards] État des sièges avant distribution : %+v", table.Seats)
 
-	// Récupérer tous les sièges occupés
-	occupiedSeats := []int{}
-	for i, seat := range table.Seats {
-		if seat.UserID != 0 && !table.PausedSeats[i] {
-			occupiedSeats = append(occupiedSeats, i)
-		}
-	}
-
-	// Trier les sièges dans l'ordre circulaire en partant de dealer+1
-	seatsIndices := []int{}
+	// 6. Construire l'ordre circulaire (comme avant)
 	n := len(table.Seats)
+	seatsIndices := []int{}
 	start := (dealerIdx + 1) % n
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		// Vérifier si ce siège est occupé
 		for _, occ := range occupiedSeats {
 			if occ == idx {
 				seatsIndices = append(seatsIndices, idx)
@@ -570,12 +597,7 @@ func DistributeCardsForHand(tableID string) {
 			}
 		}
 	}
-
-	// Si le dealer n'est pas le dernier, on l'ajoute s'il est occupé (il doit l'être)
 	if dealerIdx >= 0 && table.Seats[dealerIdx].UserID != 0 {
-		// Il est déjà dans la liste? On le met à la fin
-		// On le retire s'il a été ajouté (normalement non, car on a commencé après lui)
-		// Pour être sûr, on le retire et on l'ajoute à la fin
 		newSeats := []int{}
 		for _, s := range seatsIndices {
 			if s != dealerIdx {
@@ -584,13 +606,10 @@ func DistributeCardsForHand(tableID string) {
 		}
 		seatsIndices = append(newSeats, dealerIdx)
 	}
-
 	log.Printf("DistributeCards: dealerIdx=%d, seatsIndices=%v", dealerIdx, seatsIndices)
 
-	// Créer un nouveau deck
+	// 7. Créer le deck
 	table.Deck = createDeck()
-
-	// Fonction pour distribuer des cartes
 	dealCards := func(count int) ([]string, error) {
 		if len(table.Deck) < count {
 			return nil, fmt.Errorf("pas assez de cartes (reste %d)", len(table.Deck))
@@ -603,22 +622,39 @@ func DistributeCardsForHand(tableID string) {
 		return cards, nil
 	}
 
-	// Distribution en deux tours : 3 puis 2 cartes
+	distributionCancelled := false
+
+	// 8. Distribution avec sauvegardes intermédiaires et vérification d'annulation
 	for round := 0; round < 2; round++ {
 		cardsCount := 3
 		if round == 1 {
 			cardsCount = 2
 		}
 		for _, seatIdx := range seatsIndices {
+			// ---- Vérification d'annulation AVANT de distribuer ----
+			currentVal, _ := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+			var currentTable models.PlayingTable
+			json.Unmarshal([]byte(currentVal), &currentTable)
+			if currentTable.DistributionCancelled {
+				distributionCancelled = true
+				break
+			}
+			// --------------------------------------------------------
+
 			cards, err := dealCards(cardsCount)
 			if err != nil {
 				log.Printf("Erreur distribution pour siège %d: %v", seatIdx, err)
 				return
 			}
+
+			// Ajouter les cartes à la table locale
 			table.SeatCards[seatIdx].Hand = append(table.SeatCards[seatIdx].Hand, cards...)
 
+			// Sauvegarde intermédiaire (comme avant)
 			updatedJSON, _ := json.Marshal(table)
 			database.RedisClient.Set(database.Ctx, "table:"+tableID, updatedJSON, 24*time.Hour)
+
+			// Envoyer l'événement DEAL
 			dealEvent := map[string]interface{}{
 				"type":      "DEAL",
 				"tableId":   tableID,
@@ -629,16 +665,202 @@ func DistributeCardsForHand(tableID string) {
 			database.RedisClient.Publish(database.Ctx, "tables", dealJSON)
 			time.Sleep(1 * time.Second)
 		}
+		if distributionCancelled {
+			break
+		}
 	}
 
-	// Démarrer la manche
+	// 9. Si distribution annulée
+	if distributionCancelled {
+		log.Printf("[DISTRIBUTION] Annulée pour table %s", tableID)
+		// Vider les mains déjà distribuées dans la table locale (et en Redis)
+		for i := range table.SeatCards {
+			table.SeatCards[i].Hand = []string{}
+			table.SeatCards[i].Played = []string{}
+		}
+		SaveAndNotify(&table)
+		// Gérer l'annulation
+		handleDistributionCancellation(tableID)
+		return
+	}
+
+	// 10. Distribution réussie : démarrer la manche
 	table.GameStarted = true
 	if err := StartHand(&table); err != nil {
 		log.Printf("Erreur StartHand: %v", err)
 	}
-	updatedJSON, _ := json.Marshal(table)
-	database.RedisClient.Set(database.Ctx, "table:"+tableID, updatedJSON, 24*time.Hour)
+
+	// Sauvegarde finale
+	finalJSON, _ := json.Marshal(table)
+	database.RedisClient.Set(database.Ctx, "table:"+tableID, finalJSON, 24*time.Hour)
 	database.PublishTableUpdate(tableID)
+
+	// 11. Traiter les demandes en attente et désactiver IsDealing
+	processPendingSitRequests(tableID)
+	val2, _ := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	var endTable models.PlayingTable
+	json.Unmarshal([]byte(val2), &endTable)
+	endTable.IsDealing = false
+	SaveAndNotify(&endTable)
+}
+
+func handleDistributionCancellation(tableID string) {
+	// Récupérer la table à jour
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		return
+	}
+	var table models.PlayingTable
+	json.Unmarshal([]byte(val), &table)
+
+	// Compter les participants actifs (occupés et non en pause)
+	activeCount := 0
+	for i, seat := range table.Seats {
+		if seat.UserID != 0 && !table.PausedSeats[i] {
+			activeCount++
+		}
+	}
+
+	// Réinitialiser le flag d'annulation
+	table.DistributionCancelled = false
+
+	if activeCount >= 2 {
+		// Assez de joueurs : relancer la distribution
+		log.Printf("[DISTRIBUTION] Relance pour table %s (%d joueurs actifs)", tableID, activeCount)
+		SaveAndNotify(&table)
+		go DistributeCardsForHand(tableID)
+	} else {
+		// Pas assez de joueurs : terminer la manche
+		SaveAndNotify(&table)
+		if activeCount == 1 {
+			// Un seul joueur restant : il gagne par abandon
+			// Trouver le siège du joueur restant
+			var winnerSeat int
+			for i, seat := range table.Seats {
+				if seat.UserID != 0 && !table.PausedSeats[i] {
+					winnerSeat = i
+					break
+				}
+			}
+			winnerUserID := uint(table.Seats[winnerSeat].UserID)
+			username := GetUsernameByUserID(winnerUserID)
+			database.PublishGameEvent(tableID, fmt.Sprintf("%s gagne la manche par abandon !", username))
+			AwardPotToWinner(&table, winnerSeat)
+			table.HandWinnerSeat = winnerSeat
+			// Déterminer le prochain dealer (si le gagnant est en pause, normalement non)
+			nextDealer := winnerSeat
+			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+				if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+					start := (winnerSeat + 1) % len(table.Seats)
+					nextDealer = getNextActiveSeat(&table, start)
+					if nextDealer == -1 {
+						nextDealer = winnerSeat
+					}
+				}
+			}
+			table.DealerSeatIndex = nextDealer
+			SaveAndNotify(&table)
+			// Finaliser la manche (sans envoyer les messages déjà envoyés)
+			go finalizeHand(tableID, winnerSeat, winnerUserID, false, true)
+		} else {
+			// Aucun joueur restant : annuler la manche
+			database.PublishGameEvent(tableID, "Manche annulée, plus de joueurs")
+			table.Pot = 0
+			SaveAndNotify(&table)
+			// Réinitialiser la table (comme dans finalizeHand)
+			resetHand(&table)
+			SaveAndNotify(&table)
+			// Envoyer un message d'attente
+			database.PublishGameEvent(tableID, "En attente de joueurs...")
+		}
+	}
+}
+
+func processPendingSitRequests(tableID string) {
+	pendingKey := "table:" + tableID + ":pending_sits"
+
+	// Récupérer toutes les demandes
+	vals, err := database.RedisClient.LRange(database.Ctx, pendingKey, 0, -1).Result()
+	if err != nil || len(vals) == 0 {
+		return
+	}
+
+	// Récupérer la table
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		log.Printf("processPendingSitRequests: table introuvable")
+		return
+	}
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		log.Printf("processPendingSitRequests: erreur désérialisation")
+		return
+	}
+
+	// var remainingRequests []models.PendingSitRequest
+
+	for _, v := range vals {
+		var req models.PendingSitRequest
+		if err := json.Unmarshal([]byte(v), &req); err != nil {
+			continue
+		}
+
+		// Vérifier que le siège est libre
+		if req.SeatIndex < 0 || req.SeatIndex >= len(table.Seats) || table.Seats[req.SeatIndex].UserID != 0 {
+			// Si le siège est occupé, on ignore la demande (ou on la conserve pour un retrait ultérieur ?)
+			// Ici on ignore
+			continue
+		}
+
+		// Vérifier que l'utilisateur n'est pas déjà assis ailleurs
+		alreadySeated := false
+		for _, seat := range table.Seats {
+			if seat.UserID == int(req.UserID) {
+				alreadySeated = true
+				break
+			}
+		}
+		if alreadySeated {
+			continue
+		}
+
+		// Vérifier la bankroll (comme dans SitAtTable)
+		userKey := fmt.Sprintf("user:%d", req.UserID)
+		userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+		if err != nil {
+			continue
+		}
+		var userRedis models.UserRedis
+		if err := json.Unmarshal([]byte(userVal), &userRedis); err != nil {
+			continue
+		}
+		if userRedis.FreeChipsAmountBankroll == nil || *userRedis.FreeChipsAmountBankroll < float64(req.Amount) {
+			continue
+		}
+
+		// Déduire la bankroll
+		newBankroll := *userRedis.FreeChipsAmountBankroll - float64(req.Amount)
+		userRedis.FreeChipsAmountBankroll = &newBankroll
+		updatedUserJSON, _ := json.Marshal(userRedis)
+		database.RedisClient.Set(database.Ctx, userKey, updatedUserJSON, 72*time.Hour)
+
+		// Mettre à jour PostgreSQL (optionnel)
+		database.DB.Model(&models.User{}).Where("id = ? AND free_chips_amount_bankroll >= ?", req.UserID, req.Amount).
+			Update("free_chips_amount_bankroll", gorm.Expr("free_chips_amount_bankroll - ?", req.Amount))
+
+		// Asseoir le joueur
+		table.Seats[req.SeatIndex].UserID = int(req.UserID)
+		table.Seats[req.SeatIndex].AmountAtStake = req.Amount
+		table.SeatsConnected[req.SeatIndex] = true
+
+		log.Printf("Utilisateur %d assis sur le siège %d (traitement différé)", req.UserID, req.SeatIndex)
+	}
+
+	// Supprimer la liste Redis (toutes les demandes ont été traitées ou ignorées)
+	database.RedisClient.Del(database.Ctx, pendingKey)
+
+	// Sauvegarder la table mise à jour
+	SaveAndNotify(&table)
 }
 
 func GetUsernameFromSeat(tableID string, seatIndex int) string {
@@ -681,40 +903,36 @@ func GetUsernameByUserID(userID uint) string {
 }
 
 // finalizeHand gère la fin de manche (annonce, réinitialisation, redistribution)
-func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTriggered bool) {
-	log.Printf("[finalizeHand] table=%s, winnerSeat=%d, winnerUserID=%d, korat=%v", tableID, winnerSeat, winnerUserID, koratTriggered)
-	// Si le Korat n'a pas été déclenché, on envoie "Fin de manche"
-	if !koratTriggered {
+func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTriggered bool, fromAbandon bool) {
+	log.Printf("[finalizeHand] table=%s, winnerSeat=%d, winnerUserID=%d, korat=%v, abandon=%v", tableID, winnerSeat, winnerUserID, koratTriggered, fromAbandon)
+
+	// 1. Gérer les messages de fin de manche (sauf en cas d'abandon)
+	if !koratTriggered && !fromAbandon {
 		database.PublishGameEvent(tableID, "Fin de manche")
 	}
 	time.Sleep(3 * time.Second)
 
-	// Annonce du gagnant
-	username := GetUsernameByUserID(winnerUserID)
-	if username == "" {
-		username = fmt.Sprintf("Joueur %d", winnerUserID)
+	// 2. Annonce du gagnant (sauf en cas d'abandon)
+	if !fromAbandon {
+		username := GetUsernameByUserID(winnerUserID)
+		if username == "" {
+			username = fmt.Sprintf("Joueur %d", winnerUserID)
+		}
+		database.PublishGameEvent(tableID, username+" gagne la manche")
 	}
-	database.PublishGameEvent(tableID, username+" gagne la manche")
 	time.Sleep(3 * time.Second)
 
-	// Annonce de la prochaine manche
-	database.PublishGameEvent(tableID, "Début de la nouvelle manche")
-	time.Sleep(3 * time.Second)
-
-	// Réinitialisation de la table
+	// 3. Réinitialisation de la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		log.Printf("Erreur récupération table pour vidage: %v", err)
 		return
 	}
-
 	var updatedTable models.PlayingTable
 	if err := json.Unmarshal([]byte(val), &updatedTable); err != nil {
 		log.Printf("Erreur désérialisation pour vidage: %v", err)
 		return
 	}
-
-	log.Printf("[finalizeHand] Table récupérée depuis Redis : Seats=%+v", updatedTable.Seats)
 
 	updatedTable.CurrentRound = 0
 	updatedTable.SuitRequired = ""
@@ -726,10 +944,29 @@ func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTrigge
 		updatedTable.SeatCards[i].Played = []string{}
 	}
 
+	// Sauvegarder la table vidée
 	SaveAndNotify(&updatedTable)
 
-	// Distribution des cartes pour la nouvelle manche
-	DistributeCardsForHand(tableID)
+	// 4. Compter les joueurs actifs (occupés et non en pause)
+	activePlayers := 0
+	for i, seat := range updatedTable.Seats {
+		if seat.UserID != 0 && !updatedTable.PausedSeats[i] {
+			activePlayers++
+		}
+	}
+
+	// 5. Si au moins 2 joueurs, annoncer la nouvelle manche et distribuer
+	if activePlayers >= 2 {
+		database.PublishGameEvent(tableID, "Début de la nouvelle manche")
+		// Appeler directement DistributeCardsForHand (qui vérifiera à nouveau)
+		// On peut l'appeler en goroutine pour ne pas bloquer
+		go DistributeCardsForHand(tableID)
+	} else {
+		// Pas assez de joueurs : on attend
+		// On peut informer les clients que le jeu est en attente
+		database.PublishGameEvent(tableID, "En attente de joueurs...")
+		// On ne lance pas la distribution
+	}
 }
 
 func HandleToggleBreak(tableID string, seatIndex int, userID uint) {
@@ -767,4 +1004,125 @@ func getNextActiveSeat(table *models.PlayingTable, start int) int {
 		}
 	}
 	return -1
+}
+
+// checkAndHandleHandEndOnLeave vérifie si après le départ d'un joueur, la manche doit se terminer.
+// Si le nombre de participants restants est <= 1, on déclare le vainqueur ou on annule.
+func checkAndHandleHandEndOnLeave(table *models.PlayingTable) {
+	// Si aucune manche en cours, ne rien faire
+	if !table.GameStarted || table.CurrentRound == 0 {
+		return
+	}
+
+	// Compter les participants restants (occupés et marqués comme participants)
+	participantsCount := 0
+	lastSeatIndex := -1
+	for i := 0; i < len(table.Seats); i++ {
+		if table.ParticipatingSeats[i] && table.Seats[i].UserID != 0 {
+			participantsCount++
+			lastSeatIndex = i
+		}
+	}
+
+	// Si plus de 1 participant, on continue la manche
+	if participantsCount > 1 {
+		return
+	}
+
+	// Cas : plus aucun participant -> annulation de la manche
+	if participantsCount == 0 {
+		log.Printf("[MANCHE ANNULÉE] Plus aucun participant, pot %d perdu, redistribution", table.Pot)
+		table.Pot = 0
+		// Réinitialiser la manche comme dans finalizeHand (sans annonce)
+		resetHand(table)
+		SaveAndNotify(table)
+		// Relancer une distribution
+		go DistributeCardsForHand(table.ID)
+		return
+	}
+
+	// Cas : exactement 1 participant restant -> il est vainqueur
+	if participantsCount == 1 && lastSeatIndex != -1 {
+		winnerSeat := lastSeatIndex
+		winnerUserID := uint(table.Seats[winnerSeat].UserID)
+		username := GetUsernameByUserID(winnerUserID)
+		log.Printf("[VICTOIRE PAR ABANDON] Joueur %s (siège %d) gagne la manche par défaut", username, winnerSeat)
+
+		// Attribuer le pot au gagnant
+		AwardPotToWinner(table, winnerSeat)
+		table.HandWinnerSeat = winnerSeat
+
+		// Déterminer le prochain dealer (si gagnant en pause, mais normalement non)
+		nextDealer := winnerSeat
+		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+				start := (winnerSeat + 1) % len(table.Seats)
+				nextDealer = getNextActiveSeat(table, start)
+				if nextDealer == -1 {
+					nextDealer = winnerSeat
+				}
+			}
+		}
+		table.DealerSeatIndex = nextDealer
+
+		// Envoyer un message de victoire
+		database.PublishGameEvent(table.ID, fmt.Sprintf("%s gagne la manche par abandon !", username))
+		SaveAndNotify(table)
+
+		// Réinitialiser et redistribuer
+		// Dans le cas où il reste exactement 1 participant
+		go finalizeHand(table.ID, winnerSeat, winnerUserID, false, true) // fromAbandon = true
+	}
+}
+
+// resetHand remet à zéro les variables de manche (sans annonces)
+func resetHand(table *models.PlayingTable) {
+	table.CurrentRound = 0
+	table.SuitRequired = ""
+	table.RoundPlayedCards = []models.RoundCard{}
+	table.CurrentTurnSeatIndex = -1
+	table.ThreeSevenSeat = -1
+	for i := range table.SeatCards {
+		table.SeatCards[i].Hand = []string{}
+		table.SeatCards[i].Played = []string{}
+	}
+}
+
+func handleNoActivePlayers(table *models.PlayingTable) {
+	// Compter les joueurs avec des cartes
+	activeSeats := []int{}
+	for i, seat := range table.Seats {
+		if seat.UserID != 0 && len(table.SeatCards[i].Hand) > 0 {
+			activeSeats = append(activeSeats, i)
+		}
+	}
+	if len(activeSeats) == 1 {
+		// Un seul joueur restant : il gagne
+		winnerSeat := activeSeats[0]
+		winnerUserID := uint(table.Seats[winnerSeat].UserID)
+		username := GetUsernameByUserID(winnerUserID)
+		database.PublishGameEvent(table.ID, fmt.Sprintf("%s gagne la manche par abandon !", username))
+		AwardPotToWinner(table, winnerSeat)
+		table.HandWinnerSeat = winnerSeat
+		nextDealer := winnerSeat
+		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
+			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+				start := (winnerSeat + 1) % len(table.Seats)
+				nextDealer = getNextActiveSeat(table, start)
+				if nextDealer == -1 {
+					nextDealer = winnerSeat
+				}
+			}
+		}
+		table.DealerSeatIndex = nextDealer
+		SaveAndNotify(table)
+		go finalizeHand(table.ID, winnerSeat, winnerUserID, false, true)
+	} else {
+		// Aucun joueur restant ou plusieurs (normalement impossible ici)
+		database.PublishGameEvent(table.ID, "Manche annulée, plus de joueurs")
+		table.Pot = 0
+		resetHand(table)
+		SaveAndNotify(table)
+		go finalizeHand(table.ID, -1, 0, false, false)
+	}
 }
