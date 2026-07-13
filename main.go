@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"lekatika-server/controllers"
 	"lekatika-server/database"
 	"lekatika-server/middleware" // À créer
@@ -23,9 +24,19 @@ func main() {
 	// Connexion à Redis
 	database.ConnectRedis()
 
+	// Initialiser la liste des utilisateurs connectés depuis PostgreSQL
+	var users []models.User
+	database.DB.Where("is_connected = ?", true).Find(&users)
+	for _, u := range users {
+		// Ajouter l'ID de l'utilisateur dans le set Redis
+		database.RedisClient.SAdd(database.Ctx, "online_users", fmt.Sprintf("%d", u.ID))
+	}
+
 	hub := NewHub()
 	go hub.Run()
 	go hub.subscribeToRedis() // <-- nouvelle goroutine
+
+	controllers.SetTimerHub(hub)
 
 	// Démarrer la goroutine de nettoyage des déconnexions
 	go func() {
@@ -77,6 +88,10 @@ func main() {
 		protected.POST("/tables/:id/unseat", controllers.UnseatFromTable)
 		protected.POST("/user/profile-picture", controllers.UpdateProfilePicture)
 		protected.GET("/users/:id", controllers.GetUserByID)
+		protected.POST("/user/add-chips", controllers.AddChips)
+		protected.GET("/users/search", controllers.SearchUsers)
+		protected.GET("/online-users/count", controllers.GetOnlineUsersCount)
+		protected.GET("/online-users/list", controllers.GetOnlineUsersList)
 	}
 
 	router.Run("localhost:8080")
@@ -109,7 +124,7 @@ func serveWs(hub *Hub, c *gin.Context) {
 	hub.register <- client
 
 	// Marquer connecté
-	controllers.MarkUserConnected(userID)
+	controllers.MarkUserConnectedToTable(userID)
 
 	// Envoyer les tables à reconnecter
 	tableIDs, err := controllers.GetTablesForUser(userID)
@@ -120,6 +135,21 @@ func serveWs(hub *Hub, c *gin.Context) {
 		}
 		data, _ := json.Marshal(msg)
 		client.send <- data
+	}
+
+	// Envoyer l'état du timer pour chaque table
+	for _, tid := range tableIDs {
+		active, seatIdx, remaining := hub.GetTimerState(tid)
+		if active {
+			payload := map[string]interface{}{
+				"type":      "TIMER_START",
+				"tableId":   tid,
+				"seatIndex": seatIdx,
+				"remaining": remaining,
+			}
+			data, _ := json.Marshal(payload)
+			client.send <- data
+		}
 	}
 
 	go client.writePump()

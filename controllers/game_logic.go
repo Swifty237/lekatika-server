@@ -31,7 +31,7 @@ func getNextSeatIndex(table *models.PlayingTable, current int, checkCards bool) 
 	n := len(seats)
 	for i := 1; i <= n; i++ {
 		idx := (current + i) % n
-		if seats[idx].UserID != 0 {
+		if seats[idx].UserID != 0 && !table.PausedSeats[idx] {
 			if !checkCards || len(table.SeatCards[idx].Hand) > 0 {
 				return idx
 			}
@@ -46,8 +46,7 @@ func getNextSeatIndexInTurn(table *models.PlayingTable, current int) int {
 	n := len(seats)
 	for i := 1; i <= n; i++ {
 		idx := (current + i) % n
-		if seats[idx].UserID != 0 && len(table.SeatCards[idx].Hand) > 0 {
-			// Vérifier si ce siège a déjà joué dans ce tour
+		if seats[idx].UserID != 0 && !table.PausedSeats[idx] && len(table.SeatCards[idx].Hand) > 0 {
 			alreadyPlayed := false
 			for _, played := range table.RoundPlayedCards {
 				if played.SeatIndex == idx {
@@ -55,6 +54,7 @@ func getNextSeatIndexInTurn(table *models.PlayingTable, current int) int {
 					break
 				}
 			}
+
 			if !alreadyPlayed {
 				return idx
 			}
@@ -107,7 +107,9 @@ func StartHand(table *models.PlayingTable) error {
 		if firstPlayer == -1 {
 			return fmt.Errorf("no first player found")
 		}
+
 		table.CurrentTurnSeatIndex = firstPlayer
+		startTimerOrAutoPlay(table, table.CurrentTurnSeatIndex)
 
 		// Lancer la séquence de prélèvement des mises dans une goroutine
 		go func(tableID string, tableModel models.PlayingTable) {
@@ -239,15 +241,18 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 		Card:      card,
 	})
 
+	TimerHub.StopTimer(table.ID)
+
 	// Passer au joueur suivant (qui n'a pas encore joué dans ce tour)
 	nextPlayer := getNextSeatIndexInTurn(table, seatIndex)
 	table.CurrentTurnSeatIndex = nextPlayer
 
 	if nextPlayer == -1 {
-		// Tous les joueurs ayant des cartes ont joué dans ce tour
 		processRoundEnd(table)
 	} else {
 		SaveAndNotify(table)
+		// Redémarrer le timer ou auto-play pour le prochain joueur
+		startTimerOrAutoPlay(table, nextPlayer)
 	}
 
 	return nil
@@ -473,6 +478,7 @@ func processRoundEnd(table *models.PlayingTable) {
 		}
 	} else {
 		// --- Tour suivant ---
+		TimerHub.StopTimer(table.ID)
 		table.CurrentRound++
 		table.CurrentTurnSeatIndex = table.RoundWinnerSeatIndex
 		if len(table.SeatCards[table.CurrentTurnSeatIndex].Hand) == 0 {
@@ -481,6 +487,9 @@ func processRoundEnd(table *models.PlayingTable) {
 		table.SuitRequired = ""
 		table.RoundPlayedCards = []models.RoundCard{}
 		SaveAndNotify(table)
+		if table.CurrentTurnSeatIndex != -1 {
+			startTimerOrAutoPlay(table, table.CurrentTurnSeatIndex)
+		}
 	}
 }
 
@@ -980,7 +989,6 @@ func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTrigge
 }
 
 func HandleToggleBreak(tableID string, seatIndex int, userID uint) {
-	// Récupérer la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		log.Printf("Erreur récupération table pour toggle break: %v", err)
@@ -991,16 +999,31 @@ func HandleToggleBreak(tableID string, seatIndex int, userID uint) {
 		log.Printf("Erreur désérialisation: %v", err)
 		return
 	}
-	// Vérifier le siège et l'utilisateur
 	if seatIndex < 0 || seatIndex >= len(table.Seats) || uint(table.Seats[seatIndex].UserID) != userID {
 		log.Printf("Tentative de toggle break sur mauvais siège")
 		return
 	}
+
 	// Inverser l'état
 	table.PausedSeats[seatIndex] = !table.PausedSeats[seatIndex]
-	// Sauvegarder et notifier
 	SaveAndNotify(&table)
 	log.Printf("[BREAK] Table %s, siège %d, nouvel état: %v", tableID, seatIndex, table.PausedSeats[seatIndex])
+
+	// Si le joueur sort de pause (état après = false)
+	if !table.PausedSeats[seatIndex] && table.CurrentRound == 0 && !table.IsDealing {
+		// Compter les joueurs actifs (occupés et non en pause)
+		activePlayers := 0
+		for i, seat := range table.Seats {
+			if seat.UserID != 0 && !table.PausedSeats[i] {
+				activePlayers++
+			}
+		}
+		// S'il y a au moins 2 joueurs, lancer une nouvelle manche
+		if activePlayers >= 2 {
+			log.Printf("[BREAK] Joueur %d reprend, %d joueurs actifs, lancement d'une manche", userID, activePlayers)
+			go DistributeCardsForHand(tableID)
+		}
+	}
 }
 
 // getNextActiveSeat retourne le prochain siège occupé et non en pause à partir d'un index de départ.
@@ -1134,5 +1157,51 @@ func handleNoActivePlayers(table *models.PlayingTable) {
 		resetHand(table)
 		SaveAndNotify(table)
 		go finalizeHand(table.ID, -1, 0, false, false)
+	}
+}
+
+func AutoPlay(tableID string, seatIndex int) {
+	// Récupérer la table
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		return
+	}
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		return
+	}
+	hand := table.SeatCards[seatIndex].Hand
+	if len(hand) == 0 {
+		return
+	}
+	suitRequired := table.SuitRequired
+	selectedIndex := 0
+	if suitRequired != "" {
+		for i, card := range hand {
+			if string(card[0]) == suitRequired {
+				selectedIndex = i
+				break
+			}
+		}
+	}
+	card := hand[selectedIndex]
+	// Jouer la carte
+	if err := ProcessPlayCard(&table, seatIndex, card); err != nil {
+		log.Printf("AutoPlay error: %v", err)
+	}
+	// ProcessPlayCard sauvegarde déjà la table
+}
+
+func startTimerOrAutoPlay(table *models.PlayingTable, seatIndex int) {
+	if seatIndex < 0 || seatIndex >= len(table.Seats) {
+		return
+	}
+	// Si le joueur est en pause, jouer automatiquement
+	if table.PausedSeats[seatIndex] {
+		go func() {
+			AutoPlay(table.ID, seatIndex)
+		}()
+	} else {
+		TimerHub.StartTimer(table.ID, seatIndex)
 	}
 }

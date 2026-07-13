@@ -111,7 +111,12 @@ func CreateTable(c *gin.Context) {
 		IsDealing:             false,
 		DistributionCancelled: false,
 		RoundHistory:          []models.RoundHistoryEntry{},
+		WaitingList:           []uint{},
+		WaitingListUsernames:  []string{},
 	}
+
+	// Ajouter le créateur à la liste d'attente
+	table.WaitingList = append(table.WaitingList, table.CreatedBy)
 
 	// Stocker dans Redis (clé: table:{ID})
 	tableJSON, err := json.Marshal(table)
@@ -156,6 +161,15 @@ func GetTable(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
 		return
 	}
+
+	waitingUsernames := []string{}
+	for _, uid := range table.WaitingList {
+		username := GetUsernameByUserID(uid)
+		if username != "" {
+			waitingUsernames = append(waitingUsernames, username)
+		}
+	}
+	table.WaitingListUsernames = waitingUsernames
 
 	usernames, _ := fetchUsernames(table.Players)
 	table.PlayerUsernames = usernames
@@ -217,6 +231,45 @@ func JoinTable(c *gin.Context) {
 
 	// Mettre à jour l'utilisateur dans Redis : ajouter cette table à sa liste
 	AddTableToUser(userID.(uint), tableID)
+
+	// Vérifier si déjà assis
+	alreadySeated := false
+	for _, seat := range table.Seats {
+		if seat.UserID == int(userID.(uint)) {
+			alreadySeated = true
+			break
+		}
+	}
+
+	// Ajouter à la liste d'attente si pas assis
+	if !alreadySeated {
+		found := false
+		for _, uid := range table.WaitingList {
+			if uid == userID.(uint) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			table.WaitingList = append(table.WaitingList, userID.(uint))
+		}
+	}
+
+	// Ajouter aux players si absent
+	foundPlayer := false
+	for _, p := range table.Players {
+		if p == userID.(uint) {
+			foundPlayer = true
+			break
+		}
+	}
+
+	if !foundPlayer {
+		table.Players = append(table.Players, userID.(uint))
+	}
+
+	// Sauvegarder et notifier
+	SaveAndNotify(&table)
 
 	c.JSON(http.StatusOK, gin.H{"message": "Joined table successfully", "table": table})
 }
@@ -304,7 +357,9 @@ func LeaveTable(c *gin.Context) {
 	SaveAndNotify(&table)
 
 	// Après avoir retiré le joueur et sauvegardé
-	if table.GameStarted && table.CurrentTurnSeatIndex == seatIndex {
+	if table.GameStarted && table.CurrentRound > 0 && seatIndex == table.CurrentTurnSeatIndex {
+		// Le joueur qui se lève était le joueur actif
+		// On avance le tour (la fonction gère le timer)
 		advanceTurnAfterLeave(&table)
 	}
 
@@ -317,6 +372,11 @@ func LeaveTable(c *gin.Context) {
 
 	// Vérifier la fin de manche
 	checkAndHandleHandEndOnLeave(&table)
+
+	// Après checkAndHandleHandEndOnLeave (qui peut modifier la table)
+	if table.GameStarted && table.CurrentRound > 0 && seatIndex == table.CurrentTurnSeatIndex {
+		advanceTurnAfterLeave(&table)
+	}
 
 	if table.DealerSeatIndex == seatIndex {
 		newDealer := -1
@@ -366,6 +426,14 @@ func LeaveTable(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "Table deleted because no players left"})
 		return
 	}
+
+	newWaiting := []uint{}
+	for _, uid := range table.WaitingList {
+		if uid != userID.(uint) {
+			newWaiting = append(newWaiting, uid)
+		}
+	}
+	table.WaitingList = newWaiting
 
 	// 4. Sauvegarder la table mise à jour
 	updatedJSON, err := json.Marshal(table)
@@ -578,6 +646,14 @@ func SitAtTable(c *gin.Context) {
 		database.PublishGameStarting(tableID)
 	}
 
+	newWaiting := []uint{}
+	for _, uid := range table.WaitingList {
+		if uid != userID.(uint) {
+			newWaiting = append(newWaiting, uid)
+		}
+	}
+	table.WaitingList = newWaiting
+
 	// Sauvegarder la table mise à jour
 	updatedJSON, err := json.Marshal(table)
 
@@ -628,6 +704,7 @@ func UnseatFromTable(c *gin.Context) {
 			break
 		}
 	}
+
 	if seatIndex == -1 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not seated at this table"})
 		return
@@ -663,10 +740,11 @@ func UnseatFromTable(c *gin.Context) {
 	SaveAndNotify(&table)
 
 	// Après avoir retiré le joueur et sauvegardé
-	if table.GameStarted && table.CurrentTurnSeatIndex == seatIndex {
+	if table.GameStarted && table.CurrentRound > 0 && seatIndex == table.CurrentTurnSeatIndex {
+		// Le joueur qui se lève était le joueur actif
+		// On avance le tour (la fonction gère le timer)
 		advanceTurnAfterLeave(&table)
 	}
-
 	// Si une distribution est en cours, on annule
 	if table.IsDealing {
 		table.DistributionCancelled = true
@@ -676,6 +754,10 @@ func UnseatFromTable(c *gin.Context) {
 
 	// Vérifier la fin de manche
 	checkAndHandleHandEndOnLeave(&table)
+
+	if table.GameStarted && table.CurrentRound > 0 && seatIndex == table.CurrentTurnSeatIndex {
+		advanceTurnAfterLeave(&table)
+	}
 
 	if table.DealerSeatIndex == seatIndex {
 		newDealer := -1
@@ -706,6 +788,17 @@ func UnseatFromTable(c *gin.Context) {
 
 	usernames, _ := fetchUsernames(table.Players)
 	table.PlayerUsernames = usernames
+
+	found := false
+	for _, uid := range table.WaitingList {
+		if uid == userID.(uint) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		table.WaitingList = append(table.WaitingList, userID.(uint))
+	}
 
 	// Sauvegarder la table
 	updatedJSON, err := json.Marshal(table)
@@ -780,6 +873,8 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 		if nextPlayer != -1 {
 			table.CurrentTurnSeatIndex = nextPlayer
 			SaveAndNotify(table)
+			// Démarrer le timer ou auto-play pour le nouveau joueur
+			startTimerOrAutoPlay(table, nextPlayer)
 			return
 		}
 		// Sinon, plus de joueur, on finit la manche
@@ -818,6 +913,7 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 			if nextPlayer != -1 {
 				table.CurrentTurnSeatIndex = nextPlayer
 				SaveAndNotify(table)
+				startTimerOrAutoPlay(table, nextPlayer)
 				return
 			}
 			handleNoActivePlayers(table)
@@ -831,6 +927,7 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 			if nextPlayer != -1 {
 				table.CurrentTurnSeatIndex = nextPlayer
 				SaveAndNotify(table)
+				startTimerOrAutoPlay(table, nextPlayer)
 				return
 			}
 			handleNoActivePlayers(table)
@@ -839,6 +936,8 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 
 		table.CurrentTurnSeatIndex = secondBestSeat
 		SaveAndNotify(table)
+		// Démarrer le timer ou auto-play pour le nouveau joueur
+		startTimerOrAutoPlay(table, secondBestSeat)
 		log.Printf("Tour attribué au deuxième meilleur du round précédent (siège %d)", secondBestSeat)
 		return
 	}
@@ -848,6 +947,8 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 	if nextPlayer != -1 {
 		table.CurrentTurnSeatIndex = nextPlayer
 		SaveAndNotify(table)
+		// Démarrer le timer ou auto-play pour le nouveau joueur
+		startTimerOrAutoPlay(table, nextPlayer)
 		return
 	}
 	handleNoActivePlayers(table)

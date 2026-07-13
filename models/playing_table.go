@@ -98,4 +98,6 @@ type PlayingTable struct {
 	IsDealing             bool                `json:"isDealing"` // Vrai si une distribution est en cours
 	DistributionCancelled bool                `json:"distributionCancelled"`
 	RoundHistory          []RoundHistoryEntry `json:"roundHistory"`
+	WaitingList           []uint              `json:"waitingList"`
+	WaitingListUsernames  []string            `json:"waitingListUsernames,omitempty"`
 }

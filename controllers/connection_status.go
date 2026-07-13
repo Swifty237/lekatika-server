@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func MarkUserConnected(userID uint) {
+func MarkUserConnectedToTable(userID uint) {
 	tables, err := GetTablesForUser(userID)
 	if err != nil {
 		return
@@ -38,7 +38,7 @@ func MarkUserConnected(userID uint) {
 	}
 }
 
-func MarkUserDisconnected(userID uint) {
+func MarkUserDisconnectedToTable(userID uint) {
 	tables, err := GetTablesForUser(userID)
 	if err != nil {
 		return
