@@ -100,7 +100,9 @@ func Login(c *gin.Context) {
 		RealChipsAmountBankroll: user.RealChipsAmountBankroll,
 		ProfilePictureLink:      user.ProfilePictureLink,
 		LastModification:        user.LastModification,
-		PlayingTableIDs:         []string{}, // slice vide pour l'instant
+		PlayingTableIDs:         []string{},
+		IsConnected:             user.IsConnected,
+		Bio:                     user.Bio,
 	}
 
 	userJSON, err := json.Marshal(userRedis)
@@ -127,6 +129,8 @@ func Login(c *gin.Context) {
 			"profile_picture_link":       user.ProfilePictureLink,
 			"last_modification":          user.LastModification,
 			"playing_table_ids":          userRedis.PlayingTableIDs,
+			"isConnected":                user.IsConnected,
+			"bio":                        user.Bio,
 		},
 	})
 }

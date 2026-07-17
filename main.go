@@ -92,6 +92,7 @@ func main() {
 		protected.GET("/users/search", controllers.SearchUsers)
 		protected.GET("/online-users/count", controllers.GetOnlineUsersCount)
 		protected.GET("/online-users/list", controllers.GetOnlineUsersList)
+		protected.PUT("/user/bio", controllers.UpdateBio)
 	}
 
 	router.Run("localhost:8080")

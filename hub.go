@@ -153,13 +153,18 @@ func (h *Hub) broadcastTimerEvent(tableID string, eventType string, seatIndex in
 }
 
 func (h *Hub) handleTimerExpired(tableID string, seatIndex int) {
-	// Récupérer la table et déclencher l'auto-play
+	// Récupérer la table
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		return
 	}
 	var table models.PlayingTable
 	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		return
+	}
+	// Vérifier que le siège est toujours le joueur actif
+	if table.CurrentTurnSeatIndex < 0 || table.CurrentTurnSeatIndex != seatIndex {
+		// Le tour a changé ou n'est plus actif, on ignore
 		return
 	}
 	if seatIndex < 0 || seatIndex >= len(table.Seats) {
@@ -169,9 +174,8 @@ func (h *Hub) handleTimerExpired(tableID string, seatIndex int) {
 	if userID == 0 {
 		return
 	}
-	// Mettre en pause
+	// Mettre en pause et auto-play (comme avant)
 	controllers.HandleToggleBreak(tableID, seatIndex, userID)
-	// Auto-play
 	controllers.AutoPlay(tableID, seatIndex)
 }
 

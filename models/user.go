@@ -20,7 +20,8 @@ type User struct {
 	RealChipsAmountBankroll *float64  `json:"real_chips_amount_bankroll,omitempty"`    // entier avec virgule, nul
 	ProfilePictureLink      *string   `json:"profile_picture_link,omitempty"`          // nul
 	LastModification        time.Time `gorm:"autoUpdateTime" json:"last_modification"` // mis à jour automatiquement
-	IsConnected             bool      `gorm:"default:false"`
+	IsConnected             bool      `gorm:"default:false" json:"isConnected"`
+	Bio                     string    `json:"bio"`
 }
 
 type UserRedis struct {
@@ -38,6 +39,7 @@ type UserRedis struct {
 	LastModification        time.Time `gorm:"autoUpdateTime" json:"last_modification"` // mis à jour automatiquement
 	PlayingTableIDs         []string  `json:"playing_table_ids"`
 	IsConnected             bool      `json:"isConnected"`
+	Bio                     string    `json:"bio"`
 }
 
 // HashPassword hashe le mot de passe

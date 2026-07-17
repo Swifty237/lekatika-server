@@ -6,6 +6,7 @@ import (
 	"lekatika-server/database"
 	"lekatika-server/models"
 	"log"
+	"slices"
 	"time"
 
 	"gorm.io/gorm"
@@ -46,7 +47,7 @@ func getNextSeatIndexInTurn(table *models.PlayingTable, current int) int {
 	n := len(seats)
 	for i := 1; i <= n; i++ {
 		idx := (current + i) % n
-		if seats[idx].UserID != 0 && !table.PausedSeats[idx] && len(table.SeatCards[idx].Hand) > 0 {
+		if seats[idx].UserID != 0 && len(table.SeatCards[idx].Hand) > 0 {
 			alreadyPlayed := false
 			for _, played := range table.RoundPlayedCards {
 				if played.SeatIndex == idx {
@@ -75,6 +76,13 @@ func getFirstPlayer(table *models.PlayingTable) int {
 // StartHand démarre une nouvelle manche
 func StartHand(table *models.PlayingTable) error {
 	if table.GameStarted && table.CurrentRound == 0 {
+
+		// Créer une nouvelle entrée d'historique pour cette manche
+		table.CurrentHandHistory = &models.HandHistoryEntry{
+			HandNumber: table.HandWinnerSeat + 1, // ou un compteur si vous en avez un
+			Turns:      []models.TurnHistory{},
+		}
+
 		// Vérifier qu'il y a au moins 2 joueurs assis
 		occupied := 0
 		for i, seat := range table.Seats {
@@ -93,6 +101,9 @@ func StartHand(table *models.PlayingTable) error {
 		table.RoundWinnerSeatIndex = -1
 		table.LastRoundWinnerSeat = -1
 		table.HandWinnerSeat = -1
+
+		// Réinitialiser l'historique des rounds pour cette manche
+		table.RoundHistory = []models.RoundHistoryEntry{}
 
 		// Initialiser la liste des participants (sièges occupés)
 		table.ParticipatingSeats = make([]bool, len(table.Seats))
@@ -180,12 +191,16 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 		return fmt.Errorf("seat is empty")
 	}
 
+	// Vérifier que le tour est valide
+	if table.CurrentTurnSeatIndex < 0 {
+		// Aucun tour actif, on ne peut pas jouer
+		return fmt.Errorf("no active turn")
+	}
+
 	// Si le joueur actuel n'est pas celui-ci, on vérifie s'il est vide
 	if table.CurrentTurnSeatIndex != seatIndex {
-		// Si le joueur actuel a quitté, avancer le tour
 		if table.Seats[table.CurrentTurnSeatIndex].UserID == 0 {
 			advanceTurnAfterLeave(table)
-			// Re-vérifier si le tour est maintenant sur ce siège
 			if table.CurrentTurnSeatIndex != seatIndex {
 				return fmt.Errorf("not your turn")
 			}
@@ -194,10 +209,6 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 		}
 	}
 
-	// Vérifier que c'est le tour du joueur
-	if table.CurrentTurnSeatIndex != seatIndex {
-		return fmt.Errorf("not your turn")
-	}
 	// Vérifier que la carte est dans la main
 	hand := &table.SeatCards[seatIndex].Hand
 	found := false
@@ -315,6 +326,30 @@ func processRoundEnd(table *models.PlayingTable) {
 	}
 	table.RoundHistory = append(table.RoundHistory, entry)
 
+	// Construire l'historique du tour
+	turnHistory := models.TurnHistory{
+		TurnNumber:    table.CurrentRound,
+		CardsPlayed:   []models.TurnCard{},
+		Notifications: []string{},
+	}
+	for _, played := range table.RoundPlayedCards {
+		turnHistory.CardsPlayed = append(turnHistory.CardsPlayed, models.TurnCard{
+			SeatIndex: played.SeatIndex,
+			Card:      played.Card,
+		})
+	}
+	// Ajouter des notifications (ex: joueur a annoncé, etc.) – à adapter selon votre logique
+	// Ici vous pouvez ajouter des notifications spécifiques à ce tour (ex: "Toto a joué un carré" si c'est le cas)
+	// Pour l'instant, on stocke juste les cartes.
+	// On stockera les notifications globales plus tard.
+
+	// On ajoute ce tour à la manche courante. Pour cela, il faut stocker la manche en cours.
+	// On peut garder une variable globale dans le contexte, mais le plus simple est d'ajouter un champ `CurrentHandHistory *HandHistoryEntry` dans PlayingTable.
+
+	if table.CurrentHandHistory != nil {
+		table.CurrentHandHistory.Turns = append(table.CurrentHandHistory.Turns, turnHistory)
+	}
+
 	if table.CurrentRound == 5 {
 		// Déterminer le type de Korat
 		koratType := 0 // 0 = aucun, 1 = simple, 2 = double
@@ -431,6 +466,22 @@ func processRoundEnd(table *models.PlayingTable) {
 				AwardPotToWinner(&finalTable, ws)
 				finalTable.HandWinnerSeat = ws
 
+				// --- Construire l'historique de la manche (avec finalTable) ---
+				handHistory := buildHandHistory(&finalTable)
+				finalTable.HandHistory = append(finalTable.HandHistory, handHistory)
+
+				// Envoyer l'événement HISTORY_UPDATE avec l'historique complet
+				historyEvent := map[string]interface{}{
+					"type":    "HISTORY_UPDATE",
+					"tableId": tid,
+					"history": finalTable.HandHistory,
+				}
+				historyJSON, _ := json.Marshal(historyEvent)
+				database.RedisClient.Publish(database.Ctx, "tables", historyJSON)
+
+				// Sauvegarder la table avec l'historique
+				SaveAndNotify(&finalTable)
+
 				// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
 				nextDealer := ws
 				if ws >= 0 && ws < len(finalTable.Seats) {
@@ -456,6 +507,19 @@ func processRoundEnd(table *models.PlayingTable) {
 			AwardPotToWinner(table, winnerSeat)
 			table.HandWinnerSeat = winnerSeat
 
+			// Construire et envoyer l'historique
+			handHistory := buildHandHistory(table)
+			table.HandHistory = append(table.HandHistory, handHistory)
+			historyEvent := map[string]interface{}{
+				"type":    "HISTORY_UPDATE",
+				"tableId": table.ID,
+				"history": table.HandHistory,
+			}
+			historyJSON, _ := json.Marshal(historyEvent)
+			database.RedisClient.Publish(database.Ctx, "tables", historyJSON)
+
+			SaveAndNotify(table)
+
 			// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
 			nextDealer := winnerSeat
 			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
@@ -472,7 +536,9 @@ func processRoundEnd(table *models.PlayingTable) {
 			table.DealerSeatIndex = nextDealer
 
 			SaveAndNotify(table)
+
 			log.Printf("[FIN DE MANCHE] Pas de Korat, après attribution du pot et sauvegarde, sièges : %+v", table.Seats)
+
 			// Lancer la fin de manche normale
 			go finalizeHand(table.ID, winnerSeat, winnerUserID, false, false) // koratTriggered = false, fromAbandon = false
 		}
@@ -487,6 +553,7 @@ func processRoundEnd(table *models.PlayingTable) {
 		table.SuitRequired = ""
 		table.RoundPlayedCards = []models.RoundCard{}
 		SaveAndNotify(table)
+		// Démarrer le timer seulement si le tour est valide
 		if table.CurrentTurnSeatIndex != -1 {
 			startTimerOrAutoPlay(table, table.CurrentTurnSeatIndex)
 		}
@@ -603,17 +670,14 @@ func DistributeCardsForHand(tableID string) {
 
 	log.Printf("[DistributeCards] État des sièges avant distribution : %+v", table.Seats)
 
-	// 6. Construire l'ordre circulaire (comme avant)
+	// 6. Construire l'ordre circulaire
 	n := len(table.Seats)
 	seatsIndices := []int{}
 	start := (dealerIdx + 1) % n
-	for i := 0; i < n; i++ {
+	for i := range n {
 		idx := (start + i) % n
-		for _, occ := range occupiedSeats {
-			if occ == idx {
-				seatsIndices = append(seatsIndices, idx)
-				break
-			}
+		if slices.Contains(occupiedSeats, idx) {
+			seatsIndices = append(seatsIndices, idx)
 		}
 	}
 	if dealerIdx >= 0 && table.Seats[dealerIdx].UserID != 0 {
@@ -633,8 +697,17 @@ func DistributeCardsForHand(tableID string) {
 		if len(table.Deck) < count {
 			return nil, fmt.Errorf("pas assez de cartes (reste %d)", len(table.Deck))
 		}
+
+		// On crée une slice vide qui contiendra les cartes piochées.
 		cards := []string{}
-		for i := 0; i < count; i++ {
+		for range count {
+
+			// À chaque itération :
+			// table.Deck[0] : on prend la première carte du deck (celle du sommet).
+			// cards = append(cards, ...) : on l’ajoute à la slice cards.
+			// table.Deck = table.Deck[1:] : on supprime la première carte du deck en réaffectant la slice.
+			// Ainsi, le deck est modifié pour ne plus contenir cette carte, et la prochaine itération prendra la carte suivante.
+
 			cards = append(cards, table.Deck[0])
 			table.Deck = table.Deck[1:]
 		}
@@ -644,7 +717,7 @@ func DistributeCardsForHand(tableID string) {
 	distributionCancelled := false
 
 	// 8. Distribution avec sauvegardes intermédiaires et vérification d'annulation
-	for round := 0; round < 2; round++ {
+	for round := range 2 {
 		cardsCount := 3
 		if round == 1 {
 			cardsCount = 2
@@ -669,7 +742,7 @@ func DistributeCardsForHand(tableID string) {
 			// Ajouter les cartes à la table locale
 			table.SeatCards[seatIdx].Hand = append(table.SeatCards[seatIdx].Hand, cards...)
 
-			// Sauvegarde intermédiaire (comme avant)
+			// Sauvegarde intermédiaire
 			updatedJSON, _ := json.Marshal(table)
 			database.RedisClient.Set(database.Ctx, "table:"+tableID, updatedJSON, 24*time.Hour)
 
@@ -698,6 +771,15 @@ func DistributeCardsForHand(tableID string) {
 			table.SeatCards[i].Played = []string{}
 		}
 		SaveAndNotify(&table)
+
+		// Envoyer un événement DEALING_END pour forcer la mise à jour du front
+		dealEndEvent := map[string]interface{}{
+			"type":    "DEALING_END",
+			"tableId": tableID,
+		}
+		dealEndJSON, _ := json.Marshal(dealEndEvent)
+		database.RedisClient.Publish(database.Ctx, "tables", dealEndJSON)
+
 		// Gérer l'annulation
 		handleDistributionCancellation(tableID)
 		return
@@ -705,6 +787,7 @@ func DistributeCardsForHand(tableID string) {
 
 	// 10. Distribution réussie : démarrer la manche
 	table.GameStarted = true
+	table.IsDealing = false
 	if err := StartHand(&table); err != nil {
 		log.Printf("Erreur StartHand: %v", err)
 	}
@@ -718,13 +801,22 @@ func DistributeCardsForHand(tableID string) {
 	processPendingSitRequests(tableID)
 	val2, _ := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	var endTable models.PlayingTable
-	json.Unmarshal([]byte(val2), &endTable)
 	endTable.IsDealing = false
+	json.Unmarshal([]byte(val2), &endTable)
+
 	SaveAndNotify(&endTable)
+
+	// Envoyer un événement DEALING_END pour forcer la mise à jour du front
+	dealEndEvent := map[string]interface{}{
+		"type":    "DEALING_END",
+		"tableId": tableID,
+	}
+	dealEndJSON, _ := json.Marshal(dealEndEvent)
+	database.RedisClient.Publish(database.Ctx, "tables", dealEndJSON)
+
 }
 
 func handleDistributionCancellation(tableID string) {
-	// Récupérer la table à jour
 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		return
@@ -732,7 +824,10 @@ func handleDistributionCancellation(tableID string) {
 	var table models.PlayingTable
 	json.Unmarshal([]byte(val), &table)
 
-	// Compter les participants actifs (occupés et non en pause)
+	// Forcer la réinitialisation de IsDealing
+	table.IsDealing = false
+	table.DistributionCancelled = false
+
 	activeCount := 0
 	for i, seat := range table.Seats {
 		if seat.UserID != 0 && !table.PausedSeats[i] {
@@ -740,20 +835,14 @@ func handleDistributionCancellation(tableID string) {
 		}
 	}
 
-	// Réinitialiser le flag d'annulation
-	table.DistributionCancelled = false
-
 	if activeCount >= 2 {
-		// Assez de joueurs : relancer la distribution
 		log.Printf("[DISTRIBUTION] Relance pour table %s (%d joueurs actifs)", tableID, activeCount)
 		SaveAndNotify(&table)
 		go DistributeCardsForHand(tableID)
 	} else {
-		// Pas assez de joueurs : terminer la manche
 		SaveAndNotify(&table)
 		if activeCount == 1 {
 			// Un seul joueur restant : il gagne par abandon
-			// Trouver le siège du joueur restant
 			var winnerSeat int
 			for i, seat := range table.Seats {
 				if seat.UserID != 0 && !table.PausedSeats[i] {
@@ -766,7 +855,6 @@ func handleDistributionCancellation(tableID string) {
 			database.PublishGameEvent(tableID, fmt.Sprintf("%s gagne la manche par abandon !", username))
 			AwardPotToWinner(&table, winnerSeat)
 			table.HandWinnerSeat = winnerSeat
-			// Déterminer le prochain dealer (si le gagnant est en pause, normalement non)
 			nextDealer := winnerSeat
 			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
 				if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
@@ -779,17 +867,31 @@ func handleDistributionCancellation(tableID string) {
 			}
 			table.DealerSeatIndex = nextDealer
 			SaveAndNotify(&table)
-			// Finaliser la manche (sans envoyer les messages déjà envoyés)
+
+			// Envoyer un événement DEALING_END pour forcer la mise à jour du front
+			dealEndEvent := map[string]interface{}{
+				"type":    "DEALING_END",
+				"tableId": tableID,
+			}
+			dealEndJSON, _ := json.Marshal(dealEndEvent)
+			database.RedisClient.Publish(database.Ctx, "tables", dealEndJSON)
+
 			go finalizeHand(tableID, winnerSeat, winnerUserID, false, true)
 		} else {
 			// Aucun joueur restant : annuler la manche
 			database.PublishGameEvent(tableID, "Manche annulée, plus de joueurs")
 			table.Pot = 0
-			SaveAndNotify(&table)
-			// Réinitialiser la table (comme dans finalizeHand)
 			resetHand(&table)
 			SaveAndNotify(&table)
-			// Envoyer un message d'attente
+
+			// Envoyer un événement DEALING_END pour forcer la mise à jour du front
+			dealEndEvent := map[string]interface{}{
+				"type":    "DEALING_END",
+				"tableId": tableID,
+			}
+			dealEndJSON, _ := json.Marshal(dealEndEvent)
+			database.RedisClient.Publish(database.Ctx, "tables", dealEndJSON)
+
 			database.PublishGameEvent(tableID, "En attente de joueurs...")
 		}
 	}
@@ -1204,4 +1306,35 @@ func startTimerOrAutoPlay(table *models.PlayingTable, seatIndex int) {
 	} else {
 		TimerHub.StartTimer(table.ID, seatIndex)
 	}
+}
+
+func buildHandHistory(table *models.PlayingTable) models.HandHistoryEntry {
+	entry := models.HandHistoryEntry{
+		HandNumber:   len(table.HandHistory) + 1,
+		Turns:        []models.TurnHistory{},
+		WinnerSeat:   table.HandWinnerSeat,
+		WinnerUserID: 0,
+		IsKorat:      false,
+		IsAbandon:    false,
+	}
+	// Sécurité : ne pas accéder à Seats si WinnerSeat est invalide
+	if table.HandWinnerSeat >= 0 && table.HandWinnerSeat < len(table.Seats) {
+		entry.WinnerUserID = uint(table.Seats[table.HandWinnerSeat].UserID)
+	}
+	// Construire les tours à partir de RoundHistory (si vous l'utilisez)
+	for _, round := range table.RoundHistory {
+		turn := models.TurnHistory{
+			TurnNumber:    round.RoundNumber,
+			CardsPlayed:   []models.TurnCard{},
+			Notifications: []string{},
+		}
+		for _, played := range round.PlayedCards {
+			turn.CardsPlayed = append(turn.CardsPlayed, models.TurnCard{
+				SeatIndex: played.SeatIndex,
+				Card:      played.Card,
+			})
+		}
+		entry.Turns = append(entry.Turns, turn)
+	}
+	return entry
 }

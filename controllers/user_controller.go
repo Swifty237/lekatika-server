@@ -15,6 +15,10 @@ import (
 	"gorm.io/gorm"
 )
 
+type UpdateBioInput struct {
+	Bio string `json:"bio"`
+}
+
 func GetCurrentUser(c *gin.Context) {
 	// Récupérer l'ID utilisateur depuis le middleware d'authentification
 	userID, exists := c.Get("user_id")
@@ -179,11 +183,16 @@ func GetUserByID(c *gin.Context) {
 
 	// Convertir en UserRedis si besoin
 	userRedis := models.UserRedis{
-		Model:              gorm.Model{ID: user.ID},
-		Username:           user.Username,
-		Email:              user.Email,
-		ProfilePictureLink: user.ProfilePictureLink,
-		// ... autres champs
+		Model:                   gorm.Model{ID: user.ID},
+		Username:                user.Username,
+		Email:                   user.Email,
+		FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
+		RealChipsAmountBankroll: user.RealChipsAmountBankroll,
+		ProfilePictureLink:      user.ProfilePictureLink,
+		LastModification:        user.LastModification,
+		PlayingTableIDs:         []string{},
+		IsConnected:             user.IsConnected,
+		Bio:                     user.Bio,
 	}
 	c.JSON(http.StatusOK, gin.H{"user": userRedis})
 }
@@ -324,6 +333,7 @@ func syncUserToRedis(user models.User) {
 		LastModification:        user.LastModification,
 		PlayingTableIDs:         []string{},
 		IsConnected:             user.IsConnected,
+		Bio:                     user.Bio,
 	}
 	userJSON, _ := json.Marshal(userRedis)
 	key := fmt.Sprintf("user:%d", user.ID)
@@ -426,4 +436,42 @@ func GetOnlineUsersList(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"users": users})
+}
+
+func UpdateBio(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var input UpdateBioInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Mettre à jour PostgreSQL
+	if err := database.DB.Model(&models.User{}).Where("id = ?", userID).Update("bio", input.Bio).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update bio"})
+		return
+	}
+
+	// Mettre à jour Redis
+	key := fmt.Sprintf("user:%d", userID)
+	var userRedis models.UserRedis
+	val, err := database.RedisClient.Get(database.Ctx, key).Result()
+	if err == nil {
+		json.Unmarshal([]byte(val), &userRedis)
+		userRedis.Bio = input.Bio
+		updatedJSON, _ := json.Marshal(userRedis)
+		database.RedisClient.Set(database.Ctx, key, updatedJSON, 72*time.Hour)
+	} else {
+		// Fallback : récupérer depuis PostgreSQL et mettre à jour Redis
+		var user models.User
+		database.DB.First(&user, userID)
+		syncUserToRedis(user)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Bio updated successfully", "bio": input.Bio})
 }

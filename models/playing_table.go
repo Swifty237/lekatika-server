@@ -43,6 +43,26 @@ type RoundHistoryEntry struct {
 	WinnerCard   string      `json:"winnerCard"`
 }
 
+type TurnCard struct {
+	SeatIndex int    `json:"seatIndex"`
+	Card      string `json:"card"`
+}
+
+type TurnHistory struct {
+	TurnNumber    int        `json:"turnNumber"`
+	CardsPlayed   []TurnCard `json:"cardsPlayed"`   // Les cartes jouées dans ce tour
+	Notifications []string   `json:"notifications"` // Ex: "Le joueur X a annoncé un carré"
+}
+
+type HandHistoryEntry struct {
+	HandNumber   int           `json:"handNumber"`
+	Turns        []TurnHistory `json:"turns"`
+	WinnerSeat   int           `json:"winnerSeat"`
+	WinnerUserID uint          `json:"winnerUserID"`
+	IsKorat      bool          `json:"isKorat"`   // Si la manche a été gagnée par Korat
+	IsAbandon    bool          `json:"isAbandon"` // Si la manche a été gagnée par abandon
+}
+
 type PlayingTable struct {
 	ID                    string              `json:"id"`
 	Name                  string              `json:"name"` // Nouveau champ
@@ -100,4 +120,6 @@ type PlayingTable struct {
 	RoundHistory          []RoundHistoryEntry `json:"roundHistory"`
 	WaitingList           []uint              `json:"waitingList"`
 	WaitingListUsernames  []string            `json:"waitingListUsernames,omitempty"`
+	HandHistory           []HandHistoryEntry  `json:"handHistory"`
+	CurrentHandHistory    *HandHistoryEntry   `json:"-"`
 }

@@ -178,100 +178,70 @@ func GetTable(c *gin.Context) {
 }
 
 func JoinTable(c *gin.Context) {
+	// Récupérer l'ID de la table et l'utilisateur
 	tableID := c.Param("id")
-	userID, _ := c.Get("user_id")
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
 
-	// 1. Récupérer la table depuis Redis
-	key := "table:" + tableID
-	val, err := database.RedisClient.Get(database.Ctx, key).Result()
+	// Récupérer la table depuis Redis
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Table not found"})
 		return
 	}
-
 	var table models.PlayingTable
 	if err := json.Unmarshal([]byte(val), &table); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse table data"})
 		return
 	}
 
-	// 2. Vérifier si la table est déjà pleine (à adapter selon votre logique, par exemple 4 joueurs max)
-	if len(table.Players) >= 4 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Table is full"})
-		return
-	}
-
-	// 3. Ajouter le nouvel utilisateur s'il n'est pas déjà dans la partie
-	alreadyIn := false
-	for _, player := range table.Players {
-		if player == userID.(uint) {
-			alreadyIn = true
-			break
-		}
-	}
-	if !alreadyIn {
-		table.Players = append(table.Players, userID.(uint))
-	}
-
-	usernames, _ := fetchUsernames(table.Players)
-	table.PlayerUsernames = usernames
-
-	// 4. Sauvegarder la table mise à jour dans Redis
-	updatedTableJSON, err := json.Marshal(table)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to serialize table"})
-		return
-	}
-
-	err = database.RedisClient.Set(database.Ctx, key, updatedTableJSON, 24*time.Hour).Err()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save table"})
-		return
-	}
-
-	// Mettre à jour l'utilisateur dans Redis : ajouter cette table à sa liste
-	AddTableToUser(userID.(uint), tableID)
-
-	// Vérifier si déjà assis
-	alreadySeated := false
-	for _, seat := range table.Seats {
-		if seat.UserID == int(userID.(uint)) {
-			alreadySeated = true
-			break
-		}
-	}
-
-	// Ajouter à la liste d'attente si pas assis
-	if !alreadySeated {
-		found := false
-		for _, uid := range table.WaitingList {
-			if uid == userID.(uint) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			table.WaitingList = append(table.WaitingList, userID.(uint))
-		}
-	}
-
-	// Ajouter aux players si absent
-	foundPlayer := false
+	// Vérifier si l'utilisateur est déjà dans la table (liste Players)
+	alreadyInPlayers := false
 	for _, p := range table.Players {
 		if p == userID.(uint) {
-			foundPlayer = true
+			alreadyInPlayers = true
 			break
 		}
 	}
-
-	if !foundPlayer {
-		table.Players = append(table.Players, userID.(uint))
+	if alreadyInPlayers {
+		// L'utilisateur est déjà dans la table : on renvoie la table avec un flag
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "You are already in this table",
+			"table":     table,
+			"alreadyIn": true,
+		})
+		return
 	}
+
+	// Ajouter aux Players
+	table.Players = append(table.Players, userID.(uint))
+
+	// Ajouter à la WaitingList s'il n'y est pas déjà
+	alreadyInWaiting := false
+	for _, w := range table.WaitingList {
+		if w == userID.(uint) {
+			alreadyInWaiting = true
+			break
+		}
+	}
+	if !alreadyInWaiting {
+		table.WaitingList = append(table.WaitingList, userID.(uint))
+	}
+
+	// Mettre à jour les usernames (si besoin)
+	username := GetUsernameByUserID(userID.(uint))
+	table.PlayerUsernames = append(table.PlayerUsernames, username)
 
 	// Sauvegarder et notifier
 	SaveAndNotify(&table)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Joined table successfully", "table": table})
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Joined table successfully",
+		"table":   table,
+	})
 }
 
 func ListTables(c *gin.Context) {
@@ -836,17 +806,19 @@ func fetchUsernames(userIDs []uint) ([]string, error) {
 	return usernames, nil
 }
 
+// La fonction renvoie le tableau de cartes mélangé.
 func createDeck() []string {
 	suits := []string{"c", "d", "h", "s"}
 	values := []string{"3", "4", "5", "6", "7", "8", "9", "10"}
 	deck := []string{}
 	for _, suit := range suits {
 		for _, value := range values {
+			// On concatène la couleur et la valeur pour former une chaîne
 			deck = append(deck, suit+value)
 		}
 	}
-	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(deck), func(i, j int) {
+		// La fonction anonyme échange deux éléments aux indices i et j
 		deck[i], deck[j] = deck[j], deck[i]
 	})
 	return deck
@@ -859,47 +831,38 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 		return
 	}
 
-	// Cas où le joueur se lève alors que ce n'est pas son tour : on ne fait rien (le tour reste sur le joueur suivant déjà)
-	// Mais on vérifie : si le joueur actuel est vide, on doit avancer.
 	seatIdx := table.CurrentTurnSeatIndex
 	if seatIdx < 0 || seatIdx >= len(table.Seats) || table.Seats[seatIdx].UserID != 0 {
 		// Le joueur actuel est toujours là, rien à faire
 		return
 	}
 
-	// Si la couleur demandée est non vide, ou que c'est le round 1, on utilise la méthode normale (prochain siège avec des cartes)
+	// Si la couleur demandée est non vide, ou que c'est le round 1, on utilise la méthode normale
 	if table.SuitRequired != "" || table.CurrentRound == 1 {
 		nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
 		if nextPlayer != -1 {
 			table.CurrentTurnSeatIndex = nextPlayer
 			SaveAndNotify(table)
-			// Démarrer le timer ou auto-play pour le nouveau joueur
 			startTimerOrAutoPlay(table, nextPlayer)
 			return
 		}
-		// Sinon, plus de joueur, on finit la manche
+		// Aucun joueur trouvé : on met le tour à -1, on arrête le timer, puis on finit
+		table.CurrentTurnSeatIndex = -1
+		TimerHub.StopTimer(table.ID)
+		SaveAndNotify(table)
 		handleNoActivePlayers(table)
 		return
 	}
 
-	// Cas : round > 1 et SuitRequired vide (tour pas encore commencé)
-	// On doit trouver le joueur qui avait la deuxième meilleure carte au round précédent
+	// Cas : round > 1 et SuitRequired vide
 	if len(table.RoundHistory) >= 2 {
-		prevRound := table.RoundHistory[len(table.RoundHistory)-1] // dernier round enregistré
-		// Récupérer les cartes du round précédent pour chaque siège
-		// On a prevRound.PlayedCards qui est un []RoundCard avec SeatIndex et Card
-		// On doit trouver le meilleur (celui qui a gagné) et le deuxième meilleur
-		// Le meilleur est prevRound.WinnerSeat, qui est le joueur parti.
-		// On cherche le deuxième meilleur parmi les autres.
-
-		// Filtrer les cartes des autres joueurs (différents de winnerSeat)
+		prevRound := table.RoundHistory[len(table.RoundHistory)-1]
 		var bestCard string
-		var secondBestSeat int
+		var secondBestSeat int = -1
 		for _, played := range prevRound.PlayedCards {
 			if played.SeatIndex == prevRound.WinnerSeat {
 				continue
 			}
-			// Comparer selon la couleur (SuitRequired) du round précédent
 			if cardSuit(played.Card) == prevRound.SuitRequired {
 				if bestCard == "" || CardValue(played.Card) > CardValue(bestCard) {
 					bestCard = played.Card
@@ -907,8 +870,8 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 				}
 			}
 		}
-		// Fallback : si personne n'a de carte de la couleur, prendre le premier joueur disponible
 		if secondBestSeat == -1 {
+			// Fallback : prendre le premier joueur disponible
 			nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
 			if nextPlayer != -1 {
 				table.CurrentTurnSeatIndex = nextPlayer
@@ -916,13 +879,15 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 				startTimerOrAutoPlay(table, nextPlayer)
 				return
 			}
+			// Aucun joueur
+			table.CurrentTurnSeatIndex = -1
+			TimerHub.StopTimer(table.ID)
+			SaveAndNotify(table)
 			handleNoActivePlayers(table)
 			return
 		}
-
-		// Vérifier que ce joueur est toujours participant (a des cartes)
+		// Vérifier que ce joueur a encore des cartes
 		if len(table.SeatCards[secondBestSeat].Hand) == 0 {
-			// Il n'a plus de cartes, on passe au suivant
 			nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
 			if nextPlayer != -1 {
 				table.CurrentTurnSeatIndex = nextPlayer
@@ -930,26 +895,30 @@ func advanceTurnAfterLeave(table *models.PlayingTable) {
 				startTimerOrAutoPlay(table, nextPlayer)
 				return
 			}
+			table.CurrentTurnSeatIndex = -1
+			TimerHub.StopTimer(table.ID)
+			SaveAndNotify(table)
 			handleNoActivePlayers(table)
 			return
 		}
-
 		table.CurrentTurnSeatIndex = secondBestSeat
 		SaveAndNotify(table)
-		// Démarrer le timer ou auto-play pour le nouveau joueur
 		startTimerOrAutoPlay(table, secondBestSeat)
 		log.Printf("Tour attribué au deuxième meilleur du round précédent (siège %d)", secondBestSeat)
 		return
 	}
 
-	// Fallback : si pas d'historique, on utilise la méthode normale
+	// Fallback : si pas d'historique
 	nextPlayer := getNextSeatIndexInTurn(table, seatIdx)
 	if nextPlayer != -1 {
 		table.CurrentTurnSeatIndex = nextPlayer
 		SaveAndNotify(table)
-		// Démarrer le timer ou auto-play pour le nouveau joueur
 		startTimerOrAutoPlay(table, nextPlayer)
 		return
 	}
+	// Aucun joueur
+	table.CurrentTurnSeatIndex = -1
+	TimerHub.StopTimer(table.ID)
+	SaveAndNotify(table)
 	handleNoActivePlayers(table)
 }
