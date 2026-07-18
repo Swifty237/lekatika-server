@@ -61,6 +61,7 @@ type HandHistoryEntry struct {
 	WinnerUserID uint          `json:"winnerUserID"`
 	IsKorat      bool          `json:"isKorat"`   // Si la manche a été gagnée par Korat
 	IsAbandon    bool          `json:"isAbandon"` // Si la manche a été gagnée par abandon
+	Timestamp    int64         `json:"timestamp"`
 }
 
 type PlayingTable struct {

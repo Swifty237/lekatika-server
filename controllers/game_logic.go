@@ -1316,6 +1316,7 @@ func buildHandHistory(table *models.PlayingTable) models.HandHistoryEntry {
 		WinnerUserID: 0,
 		IsKorat:      false,
 		IsAbandon:    false,
+		Timestamp:    time.Now().UnixMilli(),
 	}
 	// Sécurité : ne pas accéder à Seats si WinnerSeat est invalide
 	if table.HandWinnerSeat >= 0 && table.HandWinnerSeat < len(table.Seats) {

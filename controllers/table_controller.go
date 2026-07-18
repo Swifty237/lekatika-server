@@ -174,6 +174,19 @@ func GetTable(c *gin.Context) {
 	usernames, _ := fetchUsernames(table.Players)
 	table.PlayerUsernames = usernames
 
+	chatKey := "chat:" + tableID
+	vals, err := database.RedisClient.LRange(database.Ctx, chatKey, 0, -1).Result()
+	if err == nil {
+		var msgs []models.ChatMessage
+		for _, v := range vals {
+			var msg models.ChatMessage
+			if err := json.Unmarshal([]byte(v), &msg); err == nil {
+				msgs = append(msgs, msg)
+			}
+		}
+		table.ChatMessages = msgs
+	}
+
 	c.JSON(http.StatusOK, gin.H{"table": table})
 }
 
