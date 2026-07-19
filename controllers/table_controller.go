@@ -107,7 +107,7 @@ func CreateTable(c *gin.Context) {
 		HandWinnerSeat:        -1,
 		RevealedSeats:         []bool{false, false, false, false},
 		ParticipatingSeats:    []bool{false, false, false, false},
-		PausedSeats:           []bool{false, false, false, false},
+		OnBreakSeats:          []bool{false, false, false, false},
 		IsDealing:             false,
 		DistributionCancelled: false,
 		RoundHistory:          []models.RoundHistoryEntry{},

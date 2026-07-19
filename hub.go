@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -35,7 +36,11 @@ type Hub struct {
 	mu          sync.RWMutex
 	tableTimers map[string]*TimerInfo
 	timersMu    sync.Mutex
+	pauseTimers map[string]*time.Timer // clé: "tableID-seatIndex"
+	pauseMu     sync.Mutex
 }
+
+const pauseExpirationMinutes = 10
 
 func NewHub() *Hub {
 	return &Hub{
@@ -44,6 +49,7 @@ func NewHub() *Hub {
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		tableTimers: make(map[string]*TimerInfo),
+		pauseTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -387,4 +393,104 @@ func (h *Hub) broadcastOnlineUsers() {
 	}
 	data, _ := json.Marshal(payload)
 	h.broadcast <- data
+}
+
+func (h *Hub) startBreakTimer(tableID string, seatIndex int) {
+	key := tableID + "-" + strconv.Itoa(seatIndex)
+	h.pauseMu.Lock()
+	defer h.pauseMu.Unlock()
+
+	// Si un timer existe déjà, on l'annule
+	if timer, ok := h.pauseTimers[key]; ok {
+		timer.Stop()
+		delete(h.pauseTimers, key)
+	}
+
+	timer := time.AfterFunc(pauseExpirationMinutes*time.Minute, func() {
+		h.clearOutPlayerOnBreak(tableID, seatIndex)
+	})
+	h.pauseTimers[key] = timer
+}
+
+func (h *Hub) stopBreakTimer(tableID string, seatIndex int) {
+	key := tableID + "-" + strconv.Itoa(seatIndex)
+	h.pauseMu.Lock()
+	defer h.pauseMu.Unlock()
+	if timer, ok := h.pauseTimers[key]; ok {
+		timer.Stop()
+		delete(h.pauseTimers, key)
+	}
+}
+
+func (h *Hub) clearOutPlayerOnBreak(tableID string, seatIndex int) {
+	// Récupérer la table
+	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+	if err != nil {
+		return
+	}
+	var table models.PlayingTable
+	if err := json.Unmarshal([]byte(val), &table); err != nil {
+		return
+	}
+	if seatIndex < 0 || seatIndex >= len(table.Seats) {
+		return
+	}
+	userID := uint(table.Seats[seatIndex].UserID)
+	if userID == 0 {
+		return
+	}
+	// Vérifier que le joueur est toujours en pause
+	if !table.OnBreakSeats[seatIndex] {
+		return
+	}
+
+	// Envoyer un message d'expulsion
+	database.PublishGameEvent(tableID, "Vous avez été déconnecté pour inactivité (pause > 10 minutes)")
+
+	// Retirer le joueur de la table
+	// On appelle un contrôleur existant ou on répète la logique
+	// Pour éviter les dépendances circulaires, on peut créer une fonction utilitaire
+	removePlayerFromTable(&table, userID, seatIndex)
+	controllers.SaveAndNotify(&table)
+}
+
+// Fonction utilitaire pour retirer un joueur
+func removePlayerFromTable(table *models.PlayingTable, userID uint, seatIndex int) {
+	// Libérer le siège
+	table.Seats[seatIndex].UserID = 0
+	table.Seats[seatIndex].AmountAtStake = 0
+	table.SeatsConnected[seatIndex] = false
+	table.OnBreakSeats[seatIndex] = false
+	// Retirer des players
+	newPlayers := []uint{}
+	for _, p := range table.Players {
+		if p != userID {
+			newPlayers = append(newPlayers, p)
+		}
+	}
+	table.Players = newPlayers
+	// Retirer de la waiting list si présent
+	newWaiting := []uint{}
+	for _, w := range table.WaitingList {
+		if w != userID {
+			newWaiting = append(newWaiting, w)
+		}
+	}
+	table.WaitingList = newWaiting
+	// Mettre à jour les usernames (on peut régénérer)
+	table.PlayerUsernames = []string{}
+	for _, pid := range table.Players {
+		username := controllers.GetUsernameByUserID(pid)
+		if username != "" {
+			table.PlayerUsernames = append(table.PlayerUsernames, username)
+		}
+	}
+}
+
+func (h *Hub) StartBreakTimer(tableID string, seatIndex int) {
+	h.startBreakTimer(tableID, seatIndex)
+}
+
+func (h *Hub) StopBreakTimer(tableID string, seatIndex int) {
+	h.startBreakTimer(tableID, seatIndex)
 }

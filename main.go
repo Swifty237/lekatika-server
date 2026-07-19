@@ -37,6 +37,7 @@ func main() {
 	go hub.subscribeToRedis() // <-- nouvelle goroutine
 
 	controllers.SetTimerHub(hub)
+	controllers.SetPrivateMessageSender(hub)
 
 	// Démarrer la goroutine de nettoyage des déconnexions
 	go func() {

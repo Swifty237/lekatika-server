@@ -115,7 +115,7 @@ type PlayingTable struct {
 	HandWinnerSeat        int                 `json:"hand_winner_seat"`
 	RevealedSeats         []bool              `json:"revealedSeats"`
 	ParticipatingSeats    []bool              `json:"participatingSeats"` // true pour les sièges participants à la manche
-	PausedSeats           []bool              `json:"pausedSeats"`
+	OnBreakSeats          []bool              `json:"onBreakSeats"`
 	IsDealing             bool                `json:"isDealing"` // Vrai si une distribution est en cours
 	DistributionCancelled bool                `json:"distributionCancelled"`
 	RoundHistory          []RoundHistoryEntry `json:"roundHistory"`

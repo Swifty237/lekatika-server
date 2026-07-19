@@ -32,7 +32,7 @@ func getNextSeatIndex(table *models.PlayingTable, current int, checkCards bool) 
 	n := len(seats)
 	for i := 1; i <= n; i++ {
 		idx := (current + i) % n
-		if seats[idx].UserID != 0 && !table.PausedSeats[idx] {
+		if seats[idx].UserID != 0 && !table.OnBreakSeats[idx] {
 			if !checkCards || len(table.SeatCards[idx].Hand) > 0 {
 				return idx
 			}
@@ -86,11 +86,12 @@ func StartHand(table *models.PlayingTable) error {
 		// Vérifier qu'il y a au moins 2 joueurs assis
 		occupied := 0
 		for i, seat := range table.Seats {
-			if seat.UserID != 0 && !table.PausedSeats[i] {
+			if seat.UserID != 0 && !table.OnBreakSeats[i] {
 				occupied++
 			}
 		}
 		if occupied < 2 {
+			database.PublishGameEvent(table.ID, "Pas assez de joueurs !")
 			return fmt.Errorf("not enough players")
 		}
 
@@ -108,7 +109,7 @@ func StartHand(table *models.PlayingTable) error {
 		// Initialiser la liste des participants (sièges occupés)
 		table.ParticipatingSeats = make([]bool, len(table.Seats))
 		for i, seat := range table.Seats {
-			if seat.UserID != 0 && !table.PausedSeats[i] {
+			if seat.UserID != 0 && !table.OnBreakSeats[i] {
 				table.ParticipatingSeats[i] = true
 			}
 		}
@@ -127,7 +128,7 @@ func StartHand(table *models.PlayingTable) error {
 			// 1. Prélèvement des mises et mise à jour des sièges
 			totalPot := 0
 			for i, seat := range tableModel.Seats {
-				if seat.UserID == 0 || tableModel.PausedSeats[i] {
+				if seat.UserID == 0 || tableModel.OnBreakSeats[i] {
 					continue
 				}
 
@@ -202,9 +203,17 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 		if table.Seats[table.CurrentTurnSeatIndex].UserID == 0 {
 			advanceTurnAfterLeave(table)
 			if table.CurrentTurnSeatIndex != seatIndex {
+				SendPrivateMessageToUser(uint(table.Seats[seatIndex].UserID), map[string]interface{}{
+					"type":    "ERROR",
+					"message": "Vous devez attendre votre tour !",
+				})
 				return fmt.Errorf("not your turn")
 			}
 		} else {
+			SendPrivateMessageToUser(uint(table.Seats[seatIndex].UserID), map[string]interface{}{
+				"type":    "ERROR",
+				"message": "Vous devez attendre votre tour !",
+			})
 			return fmt.Errorf("not your turn")
 		}
 	}
@@ -238,6 +247,10 @@ func ProcessPlayCard(table *models.PlayingTable, seatIndex int, card string) err
 			if hasSuit {
 				// Remettre la carte dans la main
 				table.SeatCards[seatIndex].Hand = append(table.SeatCards[seatIndex].Hand, card)
+				SendPrivateMessageToUser(uint(table.Seats[seatIndex].UserID), map[string]interface{}{
+					"type":    "ERROR",
+					"message": fmt.Sprintf("Vous devez jouer %s !", table.SuitRequired),
+				})
 				return fmt.Errorf("you must play a card of suit %s", table.SuitRequired)
 			}
 		}
@@ -456,7 +469,7 @@ func processRoundEnd(table *models.PlayingTable) {
 				database.PublishPotUpdate(tid, updatedTable.Pot)
 
 				time.Sleep(2 * time.Second)
-				database.PublishGameEvent(tid, "Attribution du bonus au gagnant")
+				database.PublishGameEvent(tid, "Attribution pot avec bonus au gagnant")
 				time.Sleep(2 * time.Second)
 
 				// 4. Attribuer le pot (incluant le bonus) au gagnant
@@ -485,7 +498,7 @@ func processRoundEnd(table *models.PlayingTable) {
 				// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
 				nextDealer := ws
 				if ws >= 0 && ws < len(finalTable.Seats) {
-					if finalTable.Seats[ws].UserID == 0 || finalTable.PausedSeats[ws] {
+					if finalTable.Seats[ws].UserID == 0 || finalTable.OnBreakSeats[ws] {
 						start := (ws + 1) % len(finalTable.Seats)
 						nextDealer = getNextActiveSeat(&finalTable, start)
 						if nextDealer == -1 {
@@ -523,7 +536,7 @@ func processRoundEnd(table *models.PlayingTable) {
 			// Déterminer le prochain dealer (si le gagnant est en pause, on prend le suivant)
 			nextDealer := winnerSeat
 			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
-				if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+				if table.Seats[winnerSeat].UserID == 0 || table.OnBreakSeats[winnerSeat] {
 					start := (winnerSeat + 1) % len(table.Seats)
 					nextDealer = getNextActiveSeat(table, start)
 					if nextDealer == -1 {
@@ -582,29 +595,29 @@ func SaveAndNotify(table *models.PlayingTable) {
 }
 
 // Démarre une nouvelle distribution pour une nouvelle manche
-func startNewHand(tableID string) {
-	// Récupérer la table actuelle
-	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
-	if err != nil {
-		return
-	}
-	var table models.PlayingTable
-	if err := json.Unmarshal([]byte(val), &table); err != nil {
-		return
-	}
-	// Si la table n'a pas au moins 2 joueurs, ne pas distribuer
-	occupied := 0
-	for i, seat := range table.Seats {
-		if seat.UserID != 0 && !table.PausedSeats[i] {
-			occupied++
-		}
-	}
-	if occupied < 2 {
-		return
-	}
-	// On peut lancer la distribution progressive (comme dans SitAtTable)
-	go DistributeCardsForHand(tableID)
-}
+// func startNewHand(tableID string) {
+// 	// Récupérer la table actuelle
+// 	val, err := database.RedisClient.Get(database.Ctx, "table:"+tableID).Result()
+// 	if err != nil {
+// 		return
+// 	}
+// 	var table models.PlayingTable
+// 	if err := json.Unmarshal([]byte(val), &table); err != nil {
+// 		return
+// 	}
+// 	// Si la table n'a pas au moins 2 joueurs, ne pas distribuer
+// 	occupied := 0
+// 	for i, seat := range table.Seats {
+// 		if seat.UserID != 0 && !table.OnBreakSeats[i] {
+// 			occupied++
+// 		}
+// 	}
+// 	if occupied < 2 {
+// 		return
+// 	}
+// 	// On peut lancer la distribution progressive (comme dans SitAtTable)
+// 	go DistributeCardsForHand(tableID)
+// }
 
 // DistributeCardsForHand distribue les cartes pour une nouvelle manche (5 cartes à chaque joueur assis)
 func DistributeCardsForHand(tableID string) {
@@ -622,6 +635,13 @@ func DistributeCardsForHand(tableID string) {
 
 	// 2. Marquer la distribution comme en cours
 	table.IsDealing = true
+
+	// Déterminer si c'est la première manche
+	if len(table.HandHistory) == 0 {
+		database.PublishGameStarting(tableID) // première manche
+	} else {
+		database.PublishGameEvent(tableID, "Début de la nouvelle manche !")
+	}
 	SaveAndNotify(&table)
 
 	// 3. Réinitialiser les données de la manche
@@ -638,7 +658,7 @@ func DistributeCardsForHand(tableID string) {
 	// 4. Vérifier qu'il y a au moins 2 joueurs actifs (non en pause)
 	occupiedSeats := []int{}
 	for i, seat := range table.Seats {
-		if seat.UserID != 0 && !table.PausedSeats[i] {
+		if seat.UserID != 0 && !table.OnBreakSeats[i] {
 			occupiedSeats = append(occupiedSeats, i)
 		}
 	}
@@ -652,7 +672,7 @@ func DistributeCardsForHand(tableID string) {
 
 	// 5. Déterminer le dealer
 	dealerIdx := table.DealerSeatIndex
-	if dealerIdx == -1 || table.Seats[dealerIdx].UserID == 0 || table.PausedSeats[dealerIdx] {
+	if dealerIdx == -1 || table.Seats[dealerIdx].UserID == 0 || table.OnBreakSeats[dealerIdx] {
 		start := 0
 		if dealerIdx != -1 {
 			start = (dealerIdx + 1) % len(table.Seats)
@@ -830,7 +850,7 @@ func handleDistributionCancellation(tableID string) {
 
 	activeCount := 0
 	for i, seat := range table.Seats {
-		if seat.UserID != 0 && !table.PausedSeats[i] {
+		if seat.UserID != 0 && !table.OnBreakSeats[i] {
 			activeCount++
 		}
 	}
@@ -845,7 +865,7 @@ func handleDistributionCancellation(tableID string) {
 			// Un seul joueur restant : il gagne par abandon
 			var winnerSeat int
 			for i, seat := range table.Seats {
-				if seat.UserID != 0 && !table.PausedSeats[i] {
+				if seat.UserID != 0 && !table.OnBreakSeats[i] {
 					winnerSeat = i
 					break
 				}
@@ -857,7 +877,7 @@ func handleDistributionCancellation(tableID string) {
 			table.HandWinnerSeat = winnerSeat
 			nextDealer := winnerSeat
 			if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
-				if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+				if table.Seats[winnerSeat].UserID == 0 || table.OnBreakSeats[winnerSeat] {
 					start := (winnerSeat + 1) % len(table.Seats)
 					nextDealer = getNextActiveSeat(&table, start)
 					if nextDealer == -1 {
@@ -1071,14 +1091,13 @@ func finalizeHand(tableID string, winnerSeat int, winnerUserID uint, koratTrigge
 	// 4. Compter les joueurs actifs (occupés et non en pause)
 	activePlayers := 0
 	for i, seat := range updatedTable.Seats {
-		if seat.UserID != 0 && !updatedTable.PausedSeats[i] {
+		if seat.UserID != 0 && !updatedTable.OnBreakSeats[i] {
 			activePlayers++
 		}
 	}
 
 	// 5. Si au moins 2 joueurs, annoncer la nouvelle manche et distribuer
 	if activePlayers >= 2 {
-		database.PublishGameEvent(tableID, "Début de la nouvelle manche")
 		// Appeler directement DistributeCardsForHand (qui vérifiera à nouveau)
 		// On peut l'appeler en goroutine pour ne pas bloquer
 		go DistributeCardsForHand(tableID)
@@ -1107,16 +1126,25 @@ func HandleToggleBreak(tableID string, seatIndex int, userID uint) {
 	}
 
 	// Inverser l'état
-	table.PausedSeats[seatIndex] = !table.PausedSeats[seatIndex]
+	table.OnBreakSeats[seatIndex] = !table.OnBreakSeats[seatIndex]
 	SaveAndNotify(&table)
-	log.Printf("[BREAK] Table %s, siège %d, nouvel état: %v", tableID, seatIndex, table.PausedSeats[seatIndex])
+	log.Printf("[BREAK] Table %s, siège %d, nouvel état: %v", tableID, seatIndex, table.OnBreakSeats[seatIndex])
+
+	// Gestion du timer de 10 minutes
+	if table.OnBreakSeats[seatIndex] {
+		// Joueur mis en pause : démarrer le timer
+		TimerHub.StartBreakTimer(tableID, seatIndex) // nouvelle fonction à ajouter dans TimerHubInterface
+	} else {
+		// Joueur sort de pause : arrêter le timer
+		TimerHub.StopBreakTimer(tableID, seatIndex)
+	}
 
 	// Si le joueur sort de pause (état après = false)
-	if !table.PausedSeats[seatIndex] && table.CurrentRound == 0 && !table.IsDealing {
+	if !table.OnBreakSeats[seatIndex] && table.CurrentRound == 0 && !table.IsDealing {
 		// Compter les joueurs actifs (occupés et non en pause)
 		activePlayers := 0
 		for i, seat := range table.Seats {
-			if seat.UserID != 0 && !table.PausedSeats[i] {
+			if seat.UserID != 0 && !table.OnBreakSeats[i] {
 				activePlayers++
 			}
 		}
@@ -1134,7 +1162,7 @@ func getNextActiveSeat(table *models.PlayingTable, start int) int {
 	n := len(table.Seats)
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if table.Seats[idx].UserID != 0 && !table.PausedSeats[idx] {
+		if table.Seats[idx].UserID != 0 && !table.OnBreakSeats[idx] {
 			return idx
 		}
 	}
@@ -1190,7 +1218,7 @@ func checkAndHandleHandEndOnLeave(table *models.PlayingTable) {
 		// Déterminer le prochain dealer (si gagnant en pause, mais normalement non)
 		nextDealer := winnerSeat
 		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
-			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+			if table.Seats[winnerSeat].UserID == 0 || table.OnBreakSeats[winnerSeat] {
 				start := (winnerSeat + 1) % len(table.Seats)
 				nextDealer = getNextActiveSeat(table, start)
 				if nextDealer == -1 {
@@ -1241,7 +1269,7 @@ func handleNoActivePlayers(table *models.PlayingTable) {
 		table.HandWinnerSeat = winnerSeat
 		nextDealer := winnerSeat
 		if winnerSeat >= 0 && winnerSeat < len(table.Seats) {
-			if table.Seats[winnerSeat].UserID == 0 || table.PausedSeats[winnerSeat] {
+			if table.Seats[winnerSeat].UserID == 0 || table.OnBreakSeats[winnerSeat] {
 				start := (winnerSeat + 1) % len(table.Seats)
 				nextDealer = getNextActiveSeat(table, start)
 				if nextDealer == -1 {
@@ -1299,7 +1327,7 @@ func startTimerOrAutoPlay(table *models.PlayingTable, seatIndex int) {
 		return
 	}
 	// Si le joueur est en pause, jouer automatiquement
-	if table.PausedSeats[seatIndex] {
+	if table.OnBreakSeats[seatIndex] {
 		go func() {
 			AutoPlay(table.ID, seatIndex)
 		}()
