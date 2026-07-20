@@ -9,6 +9,7 @@ import (
 	"lekatika-server/models"
 	"lekatika-server/utils"
 	"log"
+	"os"
 	"time"
 
 	"net/http"
@@ -96,7 +97,11 @@ func main() {
 		protected.PUT("/user/bio", controllers.UpdateBio)
 	}
 
-	router.Run("localhost:8080")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	router.Run("0.0.0.0:" + port) // ou router.Run(":" + port)
 }
 
 var upgrader = websocket.Upgrader{
