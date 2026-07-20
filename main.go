@@ -10,6 +10,7 @@ import (
 	"lekatika-server/utils"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"net/http"
@@ -49,11 +50,21 @@ func main() {
 		}
 	}()
 
+	// Déterminer les origines autorisées
+	allowOrigins := []string{"http://localhost:5173"} // fallback pour le développement
+	if corsOrigin := os.Getenv("CORS_ALLOW_ORIGIN"); corsOrigin != "" {
+		// Si plusieurs origines sont séparées par des virgules
+		origins := strings.Split(corsOrigin, ",")
+		for i, o := range origins {
+			origins[i] = strings.TrimSpace(o)
+		}
+		allowOrigins = origins
+	}
+
 	router := gin.Default()
 
-	// CORS (inchangé)
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:5173"},
+		AllowOrigins:     allowOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},

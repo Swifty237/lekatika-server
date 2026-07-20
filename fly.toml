@@ -1,21 +1,12 @@
-# Nom de votre application (doit correspondre à celui créé sur Fly.io)
 app = "lekatika-server"
+primary_region = "cdg"
 
-# Région principale où l'application sera déployée
-primary_region = "cdg"  # Paris, France
-
-# --- Configuration du build (buildpacks) ---
 [build]
-  # Utilisation du builder Paketo (reconnu pour Go)
-  builder = "paketobuildpacks/builder:base"
-  # Définition explicite du buildpack Go
-  buildpacks = ["gcr.io/paketo-buildpacks/go"]
+  dockerfile = "Dockerfile"
 
-# --- Variables d'environnement (non sensibles) ---
 [env]
-  PORT = "8080"  # Le port sur lequel l'application écoutera
+  PORT = "8080"
 
-# --- Configuration du service HTTP ---
 [http_service]
   internal_port = 8080
   force_https = true
@@ -24,7 +15,6 @@ primary_region = "cdg"  # Paris, France
   min_machines_running = 0
   processes = ["app"]
 
-# --- Configuration des machines (VM) ---
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
