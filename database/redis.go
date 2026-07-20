@@ -16,29 +16,37 @@ var RedisClient *redis.Client
 var Ctx = context.Background()
 
 func ConnectRedis() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("No .env file found, using defaults")
-	}
+	_ = godotenv.Load()
 
-	redisHost := os.Getenv("REDIS_HOST")
-	if redisHost == "" {
-		redisHost = "localhost"
-	}
-	redisPort := os.Getenv("REDIS_PORT")
-	if redisPort == "" {
-		redisPort = "6379"
-	}
-	redisPassword := os.Getenv("REDIS_PASSWORD") // laisser vide si pas de mot de passe
+	// Si REDIS_URL est définie, l'utiliser directement
+	if url := os.Getenv("REDIS_URL"); url != "" {
+		// Exemple: redis://default:password@host:port
+		opt, err := redis.ParseURL(url)
+		if err != nil {
+			log.Fatal("Failed to parse REDIS_URL:", err)
+		}
+		RedisClient = redis.NewClient(opt)
+	} else {
+		// Sinon, utiliser les variables individuelles
+		redisHost := os.Getenv("REDIS_HOST")
+		if redisHost == "" {
+			redisHost = "localhost"
+		}
+		redisPort := os.Getenv("REDIS_PORT")
+		if redisPort == "" {
+			redisPort = "6379"
+		}
+		redisPassword := os.Getenv("REDIS_PASSWORD")
 
-	RedisClient = redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
-		Password: redisPassword,
-		DB:       0,
-	})
+		RedisClient = redis.NewClient(&redis.Options{
+			Addr:     fmt.Sprintf("%s:%s", redisHost, redisPort),
+			Password: redisPassword,
+			DB:       0,
+		})
+	}
 
 	// Tester la connexion
-	_, err = RedisClient.Ping(Ctx).Result()
+	_, err := RedisClient.Ping(Ctx).Result()
 	if err != nil {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
