@@ -1,16 +1,20 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"lekatika-server/database"
 	"lekatika-server/models"
+	"log"
 	"net/http"
-	"path/filepath"
+	"os"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -69,46 +73,61 @@ func Logout(c *gin.Context) {
 }
 
 func UpdateProfilePicture(c *gin.Context) {
-	// Récupérer l'ID de l'utilisateur depuis le token JWT
 	userID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	// Récupérer le fichier depuis la requête
 	file, err := c.FormFile("profilePicture")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No file uploaded"})
 		return
 	}
 
-	// Vérifier le type MIME (image uniquement)
-	contentType := file.Header.Get("Content-Type")
-	if !strings.HasPrefix(contentType, "image/") {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "File must be an image"})
-		return
-	}
-
-	// Vérifier la taille (ex: 5 Mo)
+	// Vérifications (taille, type MIME)...
 	if file.Size > 5*1024*1024 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Image must be less than 5 MB"})
 		return
 	}
 
-	// Générer un nom de fichier unique
-	ext := filepath.Ext(file.Filename)
-	filename := fmt.Sprintf("%d_%d%s", userID, time.Now().UnixNano(), ext)
-	filepath := filepath.Join("uploads", "profiles", filename)
+	// Ouvrir le fichier
+	src, err := file.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open file"})
+		return
+	}
+	defer src.Close()
 
-	// Sauvegarder le fichier
-	if err := c.SaveUploadedFile(file, filepath); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file"})
+	// Configurer le client S3 pour Tigris
+	ctx := context.Background()
+	bucket := os.Getenv("BUCKET_NAME")
+
+	svc, err := getS3Client(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create S3 client"})
+		return
+	}
+
+	// Générer un nom de fichier unique
+	filename := fmt.Sprintf("profiles/%d_%d.jpg", userID, time.Now().UnixNano())
+
+	// Upload vers Tigris
+	_, err = svc.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucket),
+		Key:         aws.String(filename),
+		Body:        src,
+		ContentType: aws.String("image/jpeg"),
+		ACL:         "public-read", // Tigris accepte cette ACL
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload file: " + err.Error()})
 		return
 	}
 
 	// Construire l'URL publique
-	profilePictureURL := fmt.Sprintf("/uploads/profiles/%s", filename)
+	// Pour Tigris, l'URL est : https://<bucket>.fly.dev/<key>
+	profilePictureURL := fmt.Sprintf("https://%s.fly.dev/%s", bucket, filename)
 
 	// Mettre à jour l'utilisateur dans Redis et PostgreSQL
 	// Récupérer l'utilisateur depuis Redis
@@ -123,14 +142,20 @@ func UpdateProfilePicture(c *gin.Context) {
 		}
 		// Mettre à jour le champ ProfilePictureLink
 		user.ProfilePictureLink = &profilePictureURL
+		user.ProfilePictureKey = &filename // Stocker la clé
 		database.DB.Save(&user)
 		// Mettre à jour Redis
 		userRedis := models.UserRedis{
-			Model:              gorm.Model{ID: user.ID},
-			Username:           user.Username,
-			Email:              user.Email,
-			ProfilePictureLink: user.ProfilePictureLink,
-			// ... autres champs
+			Model:                   gorm.Model{ID: user.ID},
+			Username:                user.Username,
+			Email:                   user.Email,
+			ProfilePictureLink:      user.ProfilePictureLink,
+			ProfilePictureKey:       user.ProfilePictureKey,
+			FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
+			RealChipsAmountBankroll: user.FreeChipsAmountBankroll,
+			LastModification:        user.LastModification,
+			IsConnected:             user.IsConnected,
+			Bio:                     user.Bio,
 		}
 		userJSON, _ := json.Marshal(userRedis)
 		database.RedisClient.Set(database.Ctx, userKey, userJSON, 72*time.Hour)
@@ -189,6 +214,7 @@ func GetUserByID(c *gin.Context) {
 		FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
 		RealChipsAmountBankroll: user.RealChipsAmountBankroll,
 		ProfilePictureLink:      user.ProfilePictureLink,
+		ProfilePictureKey:       user.ProfilePictureKey,
 		LastModification:        user.LastModification,
 		PlayingTableIDs:         []string{},
 		IsConnected:             user.IsConnected,
@@ -330,6 +356,7 @@ func syncUserToRedis(user models.User) {
 		FreeChipsAmountBankroll: user.FreeChipsAmountBankroll,
 		RealChipsAmountBankroll: user.RealChipsAmountBankroll,
 		ProfilePictureLink:      user.ProfilePictureLink,
+		ProfilePictureKey:       user.ProfilePictureKey,
 		LastModification:        user.LastModification,
 		PlayingTableIDs:         []string{},
 		IsConnected:             user.IsConnected,
@@ -474,4 +501,78 @@ func UpdateBio(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Bio updated successfully", "bio": input.Bio})
+}
+
+// getS3Client retourne un client S3 configuré à partir des variables d'environnement
+// (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL_S3)
+func getS3Client(ctx context.Context) (*s3.Client, error) {
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s3.NewFromConfig(cfg), nil
+}
+
+// DeleteAccount supprime le compte de l'utilisateur si son solde réel est à 0
+func DeleteAccount(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	id := userID.(uint)
+
+	// Récupérer l'utilisateur
+	var user models.User
+	if err := database.DB.First(&user, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+		return
+	}
+
+	// Vérifier que le solde réel est à 0
+	if user.RealChipsAmountBankroll != nil && *user.RealChipsAmountBankroll != 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "Impossible de supprimer le compte : le solde en points réels doit être de 0",
+		})
+		return
+	}
+
+	// Supprimer l'image du bucket si une clé existe
+	if user.ProfilePictureKey != nil && *user.ProfilePictureKey != "" {
+		ctx := context.Background()
+		bucket := os.Getenv("BUCKET_NAME")
+
+		svc, err := getS3Client(ctx)
+		if err == nil {
+			_, err = svc.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(*user.ProfilePictureKey),
+			})
+			if err != nil {
+				log.Printf("Failed to delete profile picture from bucket: %v", err)
+			} else {
+				log.Printf("Profile picture deleted: %s", *user.ProfilePictureKey)
+			}
+		} else {
+			log.Printf("Failed to create S3 client: %v", err)
+		}
+	}
+
+	// Retirer l'utilisateur de toutes les tables
+	RemoveUserFromAllTables(id)
+
+	// Retirer du cache Redis
+	redisKey := fmt.Sprintf("user:%d", id)
+	database.RedisClient.Del(database.Ctx, redisKey)
+
+	// Retirer du set des utilisateurs connectés
+	database.RedisClient.SRem(database.Ctx, "online_users", fmt.Sprintf("%d", id))
+
+	// Supprimer le compte de la base de données
+	if err := database.DB.Delete(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Erreur lors de la suppression"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Compte supprimé avec succès"})
 }

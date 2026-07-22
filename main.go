@@ -73,7 +73,7 @@ func main() {
 	}))
 
 	// Servir les fichiers statiques du dossier uploads
-	router.Static("/uploads", "./uploads")
+	// router.Static("/uploads", "./uploads")
 
 	// Routes publiques (authentification)
 	authGroup := router.Group("/api/auth")
@@ -106,6 +106,7 @@ func main() {
 		protected.GET("/online-users/count", controllers.GetOnlineUsersCount)
 		protected.GET("/online-users/list", controllers.GetOnlineUsersList)
 		protected.PUT("/user/bio", controllers.UpdateBio)
+		protected.DELETE("/user/account", controllers.DeleteAccount)
 	}
 
 	port := os.Getenv("PORT")
