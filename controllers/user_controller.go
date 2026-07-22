@@ -100,7 +100,9 @@ func UpdateProfilePicture(c *gin.Context) {
 	defer src.Close()
 
 	// Configurer le client S3 pour Tigris
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	bucket := os.Getenv("BUCKET_NAME")
 
 	svc, err := getS3Client(ctx)
@@ -108,6 +110,41 @@ func UpdateProfilePicture(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create S3 client"})
 		return
 	}
+
+	// --- SUPPRESSION DE L'ANCIENNE PHOTO ---
+	var oldKey *string
+
+	// Essayer de récupérer l'ancienne clé depuis Redis
+	userKey := fmt.Sprintf("user:%d", userID)
+	userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+	if err == nil {
+		var existingUser models.UserRedis
+		if json.Unmarshal([]byte(userVal), &existingUser) == nil {
+			oldKey = existingUser.ProfilePictureKey
+		}
+	}
+
+	// Fallback : récupérer depuis PostgreSQL
+	if oldKey == nil || *oldKey == "" {
+		var existingUser models.User
+		if database.DB.First(&existingUser, userID).Error == nil {
+			oldKey = existingUser.ProfilePictureKey
+		}
+	}
+
+	// Supprimer l'ancienne image du bucket si elle existe
+	if oldKey != nil && *oldKey != "" {
+		_, delErr := svc.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(*oldKey),
+		})
+		if delErr != nil {
+			log.Printf("Failed to delete old profile picture (%s): %v", *oldKey, delErr)
+		} else {
+			log.Printf("Old profile picture deleted: %s", *oldKey)
+		}
+	}
+	// --- FIN SUPPRESSION ---
 
 	// Générer un nom de fichier unique
 	filename := fmt.Sprintf("profiles/%d_%d.jpg", userID, time.Now().UnixNano())
@@ -118,21 +155,22 @@ func UpdateProfilePicture(c *gin.Context) {
 		Key:         aws.String(filename),
 		Body:        src,
 		ContentType: aws.String("image/jpeg"),
-		ACL:         "public-read", // Tigris accepte cette ACL
+		// ACL:         "public-read",
 	})
 	if err != nil {
+		log.Printf("Erreur PutObject : %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload file: " + err.Error()})
 		return
 	}
 
 	// Construire l'URL publique
 	// Pour Tigris, l'URL est : https://<bucket>.fly.dev/<key>
-	profilePictureURL := fmt.Sprintf("https://%s.fly.dev/%s", bucket, filename)
+	profilePictureURL := fmt.Sprintf("https://%s.t3.tigrisfiles.io/%s", bucket, filename)
 
 	// Mettre à jour l'utilisateur dans Redis et PostgreSQL
 	// Récupérer l'utilisateur depuis Redis
-	userKey := fmt.Sprintf("user:%d", userID)
-	userVal, err := database.RedisClient.Get(database.Ctx, userKey).Result()
+	userKey = fmt.Sprintf("user:%d", userID)
+	userVal, err = database.RedisClient.Get(database.Ctx, userKey).Result()
 	if err != nil {
 		// Fallback : récupérer depuis PostgreSQL
 		var user models.User

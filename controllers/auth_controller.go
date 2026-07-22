@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"errors"
 	"fmt"
 	"lekatika-server/database"
 	"lekatika-server/models"
@@ -34,14 +35,52 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	// Vérifier si l'utilisateur existe déjà
+	// 1. Recherche de l'utilisateur (même soft-deleted) par username OU email
 	var existingUser models.User
-	if err := database.DB.Where("email = ?", input.Email).First(&existingUser).Error; err == nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
+	err := database.DB.Unscoped().Where("username = ? OR email = ?", input.Username, input.Email).First(&existingUser).Error
+
+	if err == nil {
+		// Un enregistrement existe (actif ou supprimé)
+		if existingUser.DeletedAt.Valid {
+			// 2. Le compte est soft-deleted → on le restaure
+			existingUser.DeletedAt = gorm.DeletedAt{} // remet à NULL
+
+			// Mise à jour des informations (on écrase avec les nouvelles données)
+			existingUser.Username = input.Username
+			existingUser.Email = input.Email
+			if input.FreeChipsAmountBankroll != nil {
+				existingUser.FreeChipsAmountBankroll = input.FreeChipsAmountBankroll
+			}
+			// Mise à jour du mot de passe
+			if err := existingUser.HashPassword(input.Password); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+				return
+			}
+			// Sauvegarde en base (supprime le soft delete)
+			if err := database.DB.Save(&existingUser).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to restore user"})
+				return
+			}
+
+			// 3. Mettre à jour le cache Redis (optionnel mais recommandé)
+			//    On peut synchroniser directement ou laisser le login le faire plus tard.
+			//    Pour éviter un état incohérent, on le fait ici.
+			syncUserToRedis(existingUser)
+
+			c.JSON(http.StatusOK, gin.H{"message": "Account restored successfully"})
+			return
+		} else {
+			// Compte actif → conflit
+			c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
+			return
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		// Autre erreur inattendue
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
-	// Créer un nouvel utilisateur
+	// 4. Aucun utilisateur trouvé (même supprimé) → création normale
 	user := models.User{
 		Username:                input.Username,
 		Email:                   input.Email,
@@ -51,14 +90,19 @@ func Register(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
-
 	if err := database.DB.Create(&user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 		return
 	}
 
+	// (Optionnel) on peut aussi ajouter l'utilisateur en cache Redis après création
+	// mais cela sera fait lors du login.
+
 	c.JSON(http.StatusOK, gin.H{"message": "Registration successful"})
 }
+
+// syncUserToRedis (déjà présente dans user_controller.go) est utilisée pour mettre à jour le cache.
+// Elle doit être exportée ou accessible dans le package controllers.
 
 func Login(c *gin.Context) {
 	var input LoginInput
